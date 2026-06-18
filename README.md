@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  English | <a href="README_CN.md">中文</a>
+  English | <a href="README_CN.md">中文</a> | <a href="README_JA.md">日本語</a> | <a href="README_KO.md">한국어</a>
 </p>
 
 ---
@@ -32,15 +32,18 @@
 
 - **Two-Step Chain-of-Thought Ingest** — LLM analyzes first, then generates wiki pages with source traceability and incremental cache
 - **Multimodal Image Ingestion** — extract embedded images from PDFs, generate factual captions with a vision LLM, surface them in image-aware search results with lightbox preview and jump-to-source
+- **Optional MinerU PDF Parsing** — use MinerU cloud parsing for complex PDFs with tables, formulas, and dense layouts; the built-in local parser remains the default
 - **4-Signal Knowledge Graph** — relevance model with direct links, source overlap, Adamic-Adar, and type affinity
 - **Louvain Community Detection** — automatic knowledge cluster discovery with cohesion scoring
 - **Graph Insights** — surprising connections and knowledge gaps with one-click Deep Research
 - **Vector Semantic Search** — optional embedding-based retrieval via LanceDB, supports any OpenAI-compatible endpoint
 - **Persistent Ingest Queue** — serial processing with crash recovery, cancel, retry, and progress visualization
 - **Folder Import** — recursive folder import preserving directory structure, folder context as LLM classification hint
-- **Deep Research** — LLM-optimized search topics, multi-query web search, auto-ingest results into wiki
+- **Source Folder Auto-Watch** — detects external changes in `raw/sources/` and keeps ingest/delete cleanup in sync
+- **Deep Research** — LLM-optimized search topics, multi-query web search via Tavily, SerpApi, or SearXNG, auto-ingest results into wiki
 - **Async Review System** — LLM flags items for human judgment, predefined actions, pre-generated search queries
 - **Chrome Web Clipper** — one-click web page capture with auto-ingest into knowledge base
+- **Local HTTP API + MCP Server + AI Agent Skill** — built-in `127.0.0.1:19828` JSON API and bundled MCP server for hybrid search, file read, graph traversal, and source rescan; ready-made [agent skill](https://github.com/nashsu/llm_wiki_skill) installs into Claude Code / Codex with one command (`npx skills add …`)
 
 ## What is this?
 
@@ -116,12 +119,14 @@ Additional ingest enhancements beyond the original:
 - **SHA256 incremental cache** — source file content is hashed before ingest; unchanged files are skipped automatically, saving LLM tokens and time
 - **Persistent ingest queue** — serial processing prevents concurrent LLM calls; queue persisted to disk, survives app restart; failed tasks auto-retry up to 3 times
 - **Folder import** — recursive folder import preserving directory structure; folder path passed to LLM as classification context (e.g., "papers > energy" helps categorize content)
+- **Source folder auto-watch** — files added, edited, or deleted in `raw/sources/` outside the app are picked up automatically and reuse the same ingest/delete lifecycle as in-app actions
 - **Queue visualization** — Activity Panel shows progress bar, pending/processing/failed tasks with cancel and retry buttons
 - **Auto-embedding** — when vector search is enabled, new pages are automatically embedded after ingest
 - **Source traceability** — every generated wiki page includes a `sources: []` field in YAML frontmatter, linking back to the raw source files that contributed to it
 - **overview.md auto-update** — global summary page regenerated on every ingest to reflect the latest state of the wiki
 - **Guaranteed source summary** — fallback ensures a source summary page is always created, even if the LLM omits it
 - **Language-aware generation** — LLM responds in the user's configured language (English or Chinese)
+- **Progressive Sources view** — large source folders render progressively while scrolling, keeping big source collections responsive
 
 ### 4. Knowledge Graph with Relevance Model
 
@@ -266,7 +271,8 @@ The original suggests staying involved during ingest. We added an **asynchronous
 
 Not in the original. When the LLM identifies knowledge gaps:
 
-- **Web search** (Tavily API) finds relevant sources with full content extraction (no truncation)
+- **Web search** via Tavily, SerpApi, or SearXNG finds relevant sources with full content extraction (no truncation)
+- **Provider-specific configuration** — Tavily and SerpApi use independent API keys; SerpApi supports selectable engines, while SearXNG uses a configured instance URL and search categories
 - **Multiple search queries** per topic — LLM-generated at ingest time, optimized for search engines
 - **LLM-optimized research topics** — when triggered from Graph Insights, LLM reads overview.md + purpose.md to generate domain-specific topics and queries (not generic keywords)
 - **User confirmation dialog** — editable topic and search queries shown for review before research starts
@@ -298,13 +304,15 @@ The original focuses on text/markdown. We support structured extraction preservi
 
 | Format | Method |
 |--------|--------|
-| PDF | pdf-extract (Rust) with file caching |
+| PDF | Built-in pdf-extract (Rust) with file caching; optional MinerU cloud parsing for tables, formulas, and complex layouts |
 | DOCX | docx-rs — headings, bold/italic, lists, tables → structured Markdown |
 | PPTX | ZIP + XML — slide-by-slide extraction with heading/list structure |
 | XLSX/XLS/ODS | calamine — proper cell types, multi-sheet support, Markdown tables |
 | Images | Native preview (png, jpg, gif, webp, svg, etc.) |
 | Video/Audio | Built-in player |
 | Web clips | Readability.js + Turndown.js → clean Markdown |
+
+> MinerU is optional. When enabled, PDF files are uploaded to MinerU cloud for parsing; keep the built-in parser for sensitive documents. If MinerU fails, LLM Wiki falls back to the built-in parser. MinerU usage is subject to its file size, page count, and quota limits.
 
 ### 15. File Deletion with Cascade Cleanup
 
@@ -356,12 +364,12 @@ The original is platform-agnostic (abstract pattern). We handle concrete cross-p
 | Graph | sigma.js + graphology + ForceAtlas2 |
 | Search | Tokenized search + graph relevance + optional vector (LanceDB) |
 | Vector DB | LanceDB (Rust, embedded, optional) |
-| PDF | pdf-extract |
+| PDF | pdf-extract + optional MinerU cloud parser |
 | Office | docx-rs + calamine |
 | i18n | react-i18next |
 | State | Zustand |
 | LLM | Streaming fetch (OpenAI, Anthropic, Google, Ollama, Custom) |
-| Web Search | Tavily API |
+| Web Search | Tavily, SerpApi, SearXNG JSON API |
 
 ## Installation
 
@@ -394,12 +402,42 @@ npm run tauri build    # Production build
 
 1. Launch the app → Create a new project (choose a template)
 2. Go to **Settings** → Configure your LLM provider (API key + model)
-3. Go to **Sources** → Import documents (PDF, DOCX, MD, etc.)
-4. Watch the **Activity Panel** — LLM automatically builds wiki pages
-5. Use **Chat** to query your knowledge base
-6. Browse the **Knowledge Graph** to see connections
-7. Check **Review** for items needing your attention
-8. Run **Lint** periodically to maintain wiki health
+3. Optional: configure **Web Search** providers and source folder auto-watch in Settings
+4. Go to **Sources** → Import documents (PDF, DOCX, MD, etc.)
+5. Watch the **Activity Panel** — LLM automatically builds wiki pages
+6. Use **Chat** to query your knowledge base
+7. Browse the **Knowledge Graph** to see connections
+8. Check **Review** for items needing your attention
+9. Run **Lint** periodically to maintain wiki health
+
+## Local HTTP API + MCP Server + AI Agent Skill
+
+LLM Wiki ships a built-in local HTTP API at `http://127.0.0.1:19828` (token-protected, `127.0.0.1`-only) so external tools — including AI agents like **Claude Code**, **Codex**, or any HTTP-capable script — can query your wiki:
+
+- `GET /api/v1/health` — server status (no auth)
+- `GET /api/v1/projects` — list projects
+- `GET /api/v1/projects/{id}/files` / `files/content` — read files and content
+- `GET /api/v1/projects/{id}/reviews?status=unresolved` — export Review tab items for wiki maintenance (`status`: `unresolved`, `resolved`, or `all`; optional `type` and `limit`)
+- `POST /api/v1/projects/{id}/search` — **hybrid** retrieval (keyword + vector) returning `mode`, `tokenHits`, `vectorHits`, per-result `vectorScore`
+- `GET /api/v1/projects/{id}/graph` — wikilinks graph
+- `POST /api/v1/projects/{id}/sources/rescan` — trigger a backend rescan
+
+Enable the API, generate a token, and choose whether local unauthenticated access is allowed in **Settings → API + MCP**.
+
+For MCP-compatible clients, LLM Wiki also includes a local MCP server in `mcp-server/`. After building it with `npm run mcp:build`, **Settings → API + MCP** shows a copyable MCP client configuration with the correct local path for your machine. The MCP tools call the same API surface, so agent clients can list projects, read files, export unresolved Review items, run hybrid search, inspect the graph, and trigger source rescans without custom HTTP glue code.
+
+### Plug your AI agent in with one command
+
+A ready-made **agent skill** for LLM Wiki lives in its own repo. Install it into Claude Code / Codex / any skills-compatible runtime:
+
+```bash
+npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm_wiki_skill
+```
+
+After install, the agent can answer prompts like "what does my LLM Wiki say about X", "search my 知识库 for Y", "show the neighborhood of node Z in my wiki graph", and "rescan my wiki sources" by talking to your locally-running app — read-only by default, citing wiki page paths so you can verify in-app.
+
+- **Skill repo**: <https://github.com/nashsu/llm_wiki_skill>
+- **Trigger discipline**: it intentionally does **not** trigger on generic "search my notes" / "check my Obsidian / Notion / Logseq" — only when you explicitly name LLM Wiki / `my wiki` / `知识库`.
 
 ## Project Structure
 

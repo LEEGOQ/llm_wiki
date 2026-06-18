@@ -9,6 +9,8 @@ import { LLM_PRESETS, type LlmPreset } from "../llm-presets"
 import { ContextSizeSelector } from "../context-size-selector"
 import { resolveConfig } from "../preset-resolver"
 import { normalizeEndpoint } from "@/lib/endpoint-normalizer"
+import { AZURE_OPENAI_API_VERSION } from "@/lib/azure-openai"
+import { testLlmConnection, testLlmFunction, type ProviderTestResult } from "@/lib/connection-tests"
 
 export function LlmProviderSection() {
   const { t } = useTranslation()
@@ -101,6 +103,11 @@ interface PresetRowProps {
   onChange: (patch: ProviderOverride) => void
 }
 
+type ProviderTestState =
+  | { kind: "idle" }
+  | { kind: "running"; label: string }
+  | { kind: "done"; result: ProviderTestResult }
+
 function PresetRow({
   preset,
   override,
@@ -117,13 +124,40 @@ function PresetRow({
   const apiKey = ov.apiKey ?? ""
   const apiMode = ov.apiMode ?? preset.apiMode ?? "chat_completions"
   const baseUrl = ov.baseUrl ?? preset.baseUrl ?? ""
+  const azureApiVersion = ov.azureApiVersion ?? preset.azureApiVersion ?? AZURE_OPENAI_API_VERSION
+  const azureModelFamily = ov.azureModelFamily ?? preset.azureModelFamily ?? "auto"
   const context = ov.maxContextSize ?? preset.suggestedContextSize ?? 131072
   const reasoning = ov.reasoning ?? { mode: "auto" as const }
-  const hasConfig = !!apiKey || !!ov.baseUrl || !!ov.model
-  // Claude Code CLI authenticates via the user's existing ~/.claude OAuth
-  // (inherited from the spawned subprocess), so no API key field is
-  // shown. Ollama ditto for its local-only model.
-  const needsApiKey = preset.provider !== "ollama" && preset.provider !== "claude-code"
+  const localCliIsolation = ov.localCliIsolation === true
+  const codexCliTimeoutMinutes = Math.max(1, Math.min(240, ov.codexCliTimeoutMinutes ?? 10))
+  const isLocalCliProvider = preset.provider === "claude-code" || preset.provider === "codex-cli"
+  const [testState, setTestState] = useState<ProviderTestState>({ kind: "idle" })
+  const hasConfig = !!apiKey || !!ov.baseUrl || !!ov.model || !!ov.azureApiVersion || !!ov.azureModelFamily
+  // Local CLI providers authenticate via their own existing login state
+  // (inherited by the spawned subprocess), so no API key field is shown.
+  // Ollama ditto for its local-only model.
+  const needsApiKey =
+    preset.provider !== "ollama" &&
+    preset.provider !== "claude-code" &&
+    preset.provider !== "codex-cli"
+
+  const resolvedConfig = useMemo(
+    () => resolveConfig(preset, ov, useWikiStore.getState().llmConfig),
+    [apiKey, apiMode, azureApiVersion, azureModelFamily, baseUrl, context, model, preset, reasoning, ov],
+  )
+
+  async function runProviderTest(kind: "connection" | "function") {
+    setTestState({
+      kind: "running",
+      label: kind === "connection"
+        ? t("settings.sections.llm.testingConnection")
+        : t("settings.sections.llm.testingFunction"),
+    })
+    const result = kind === "connection"
+      ? await testLlmConnection(resolvedConfig)
+      : await testLlmFunction(resolvedConfig)
+    setTestState({ kind: "done", result })
+  }
 
   return (
     <div
@@ -184,7 +218,7 @@ function PresetRow({
               : "border-muted-foreground/30 bg-muted-foreground/20 hover:bg-muted-foreground/30"
           }`}
           title={isActive ? t("settings.sections.llm.toggleOff") : t("settings.sections.llm.toggleOn")}
-          aria-label={isActive ? "Deactivate" : "Activate"}
+          aria-label={isActive ? t("settings.sections.llm.deactivate") : t("settings.sections.llm.activate")}
         >
           <span
             className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm ring-1 ring-black/10 transition-transform ${
@@ -199,7 +233,7 @@ function PresetRow({
         <div className="space-y-4 border-t bg-background/50 px-4 py-3">
           {preset.provider === "custom" && (
             <div className="space-y-2">
-              <Label>API Mode</Label>
+              <Label>{t("settings.sections.llm.apiMode")}</Label>
               <div className="flex flex-wrap gap-2">
                 {(
                   [
@@ -237,20 +271,121 @@ function PresetRow({
             </div>
           )}
 
-          {(preset.provider === "custom" || preset.provider === "ollama") && (
+          {(preset.provider === "custom" || preset.provider === "ollama" || preset.provider === "azure") && (
             <EndpointField
               value={baseUrl}
-              mode={apiMode}
+              mode={preset.provider === "azure" ? "azure" : apiMode}
               placeholder={preset.baseUrl ?? "https://your-api.example.com/v1"}
               onChange={(v) => onChange({ baseUrl: v })}
             />
           )}
 
+          {preset.provider === "azure" && (
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>{t("settings.sections.llm.azureApiVersion")}</Label>
+                <Input
+                  value={azureApiVersion}
+                  onChange={(e) => onChange({ azureApiVersion: e.target.value })}
+                  placeholder="2024-10-21"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.sections.llm.azureApiVersionHint")}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>{t("settings.sections.llm.azureModelFamily")}</Label>
+                <select
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  value={azureModelFamily}
+                  onChange={(e) => onChange({ azureModelFamily: e.target.value as typeof azureModelFamily })}
+                >
+                  <option value="auto">{t("settings.sections.llm.azureModelFamilyAuto")}</option>
+                  <option value="gpt5">{t("settings.sections.llm.azureModelFamilyGpt5")}</option>
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.sections.llm.azureModelFamilyHint")}
+                </p>
+              </div>
+            </div>
+          )}
+
           {preset.provider === "claude-code" && <ClaudeCliStatusPill />}
+          {preset.provider === "codex-cli" && <CodexCliStatusPill />}
+
+          {isLocalCliProvider && (
+            <div className="space-y-2 rounded-md border p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">
+                    {t("settings.sections.llm.localCliIsolation")}
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {t("settings.sections.llm.localCliIsolationHint")}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onChange({ localCliIsolation: !localCliIsolation })}
+                  className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                    localCliIsolation
+                      ? "border-primary bg-primary"
+                      : "border-muted-foreground/30 bg-muted-foreground/20 hover:bg-muted-foreground/30"
+                  }`}
+                  title={
+                    localCliIsolation
+                      ? t("settings.sections.llm.localCliIsolationOn")
+                      : t("settings.sections.llm.localCliIsolationOff")
+                  }
+                  aria-label={t("settings.sections.llm.localCliIsolation")}
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm ring-1 ring-black/10 transition-transform ${
+                      localCliIsolation ? "translate-x-4" : "translate-x-0.5"
+                    }`}
+                  />
+                </button>
+              </div>
+              <div className="rounded-md bg-muted/50 px-2 py-1.5 text-xs text-muted-foreground">
+                {localCliIsolation
+                  ? t("settings.sections.llm.localCliIsolationOn")
+                  : t("settings.sections.llm.localCliIsolationOff")}
+              </div>
+            </div>
+          )}
+
+          {preset.provider === "codex-cli" && (
+            <div className="space-y-2 rounded-md border p-3">
+              <Label>{t("settings.sections.llm.codexCliTimeout")}</Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={1}
+                  max={240}
+                  className="w-28"
+                  value={codexCliTimeoutMinutes}
+                  onChange={(e) => {
+                    const n = Number(e.target.value)
+                    onChange({
+                      codexCliTimeoutMinutes: Number.isFinite(n)
+                        ? Math.max(1, Math.min(240, Math.floor(n)))
+                        : undefined,
+                    })
+                  }}
+                />
+                <span className="text-xs text-muted-foreground">
+                  {t("settings.sections.llm.codexCliTimeoutUnit")}
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t("settings.sections.llm.codexCliTimeoutHint")}
+              </p>
+            </div>
+          )}
 
           {needsApiKey && (
             <div className="space-y-2">
-              <Label>API Key</Label>
+              <Label>{t("settings.apiKey")}</Label>
               <Input
                 type="password"
                 value={apiKey}
@@ -265,7 +400,11 @@ function PresetRow({
           )}
 
           <div className="space-y-2">
-            <Label>Model</Label>
+            <Label>
+              {preset.provider === "azure"
+                ? t("settings.sections.llm.deploymentName", "Deployment name")
+                : t("settings.model")}
+            </Label>
             <ModelPicker
               value={model}
               suggestions={preset.suggestedModels ?? []}
@@ -275,7 +414,7 @@ function PresetRow({
           </div>
 
           <div className="space-y-2">
-            <Label>Context window</Label>
+            <Label>{t("settings.sections.llm.contextWindow")}</Label>
             <ContextSizeSelector
               value={context}
               onChange={(v) => onChange({ maxContextSize: v })}
@@ -286,6 +425,49 @@ function PresetRow({
             value={reasoning}
             onChange={(reasoning) => onChange({ reasoning })}
           />
+
+          <div className="space-y-2 rounded-md border p-3">
+            <div>
+              <div className="text-sm font-medium">
+                {t("settings.sections.llm.providerTests")}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t("settings.sections.llm.providerTestsHint")}
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void runProviderTest("connection")}
+                disabled={testState.kind === "running"}
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {t("settings.sections.llm.testConnection")}
+              </button>
+              <button
+                type="button"
+                onClick={() => void runProviderTest("function")}
+                disabled={testState.kind === "running"}
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {t("settings.sections.llm.testFunction")}
+              </button>
+            </div>
+            {testState.kind === "running" && (
+              <p className="text-xs text-muted-foreground">{testState.label}</p>
+            )}
+            {testState.kind === "done" && (
+              <div
+                className={`rounded-md border px-3 py-2 text-xs ${
+                  testState.result.ok
+                    ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400"
+                    : "border-destructive/40 bg-destructive/5 text-destructive"
+                }`}
+              >
+                {testState.result.message}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -299,19 +481,20 @@ function ReasoningControls({
   value: ReasoningConfig
   onChange: (value: ReasoningConfig) => void
 }) {
+  const { t } = useTranslation()
   const modes: { value: ReasoningMode; label: string }[] = [
-    { value: "auto", label: "Auto" },
-    { value: "off", label: "Off" },
-    { value: "low", label: "Low" },
-    { value: "medium", label: "Medium" },
-    { value: "high", label: "High" },
-    { value: "max", label: "Max" },
-    { value: "custom", label: "Custom" },
+    { value: "auto", label: t("settings.sections.llm.reasoning.auto") },
+    { value: "off", label: t("settings.sections.llm.reasoning.off") },
+    { value: "low", label: t("settings.sections.llm.reasoning.low") },
+    { value: "medium", label: t("settings.sections.llm.reasoning.medium") },
+    { value: "high", label: t("settings.sections.llm.reasoning.high") },
+    { value: "max", label: t("settings.sections.llm.reasoning.max") },
+    { value: "custom", label: t("settings.sections.llm.reasoning.custom") },
   ]
 
   return (
     <div className="space-y-2">
-      <Label>Reasoning / thinking</Label>
+      <Label>{t("settings.sections.llm.reasoning.title")}</Label>
       <div className="flex flex-wrap gap-1.5">
         {modes.map((m) => {
           const active = value.mode === m.value
@@ -348,11 +531,13 @@ function ReasoningControls({
             }}
             placeholder="1024"
           />
-          <span className="text-xs text-muted-foreground">thinking budget tokens</span>
+          <span className="text-xs text-muted-foreground">
+            {t("settings.sections.llm.reasoning.budgetTokens")}
+          </span>
         </div>
       )}
       <p className="text-xs text-muted-foreground">
-        Structured tasks such as ingest may override this to Off to avoid reasoning-only responses.
+        {t("settings.sections.llm.reasoning.hint")}
       </p>
     </div>
   )
@@ -360,7 +545,7 @@ function ReasoningControls({
 
 interface EndpointFieldProps {
   value: string
-  mode: "chat_completions" | "anthropic_messages"
+  mode: "chat_completions" | "anthropic_messages" | "azure"
   placeholder: string
   onChange: (value: string) => void
 }
@@ -385,7 +570,7 @@ function EndpointField({ value, mode, placeholder, onChange }: EndpointFieldProp
 
   return (
     <div className="space-y-1.5">
-      <Label>Endpoint</Label>
+      <Label>{t("settings.sections.llm.endpoint")}</Label>
       <Input
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -443,6 +628,7 @@ interface ModelPickerProps {
  * `suggestedModels` render the input alone.
  */
 function ModelPicker({ value, suggestions, placeholder, onChange }: ModelPickerProps) {
+  const { t } = useTranslation()
   const hasSuggestions = suggestions.length > 0
   const isCustom = hasSuggestions && value.length > 0 && !suggestions.includes(value)
 
@@ -462,7 +648,7 @@ function ModelPicker({ value, suggestions, placeholder, onChange }: ModelPickerP
                     ? "border-primary bg-primary text-primary-foreground"
                     : "border-border bg-background hover:bg-accent hover:text-accent-foreground"
                 }`}
-                title={`Use ${m}`}
+                title={t("settings.sections.llm.useModel", { model: m })}
               >
                 {m}
               </button>
@@ -476,9 +662,11 @@ function ModelPicker({ value, suggestions, placeholder, onChange }: ModelPickerP
                 ? "border-primary/60 bg-primary/10 text-primary"
                 : "border-dashed border-muted-foreground/40 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             }`}
-            title="Type a custom model id"
+            title={t("settings.sections.llm.typeCustomModel")}
           >
-            {isCustom ? `Custom: ${value}` : "Custom…"}
+            {isCustom
+              ? t("settings.sections.llm.customModelBadge", { model: value })
+              : t("settings.sections.llm.customModel")}
           </button>
         </div>
       )}
@@ -589,6 +777,96 @@ function ClaudeCliStatusPill() {
                 Install from{" "}
                 <code className="rounded bg-background/60 px-1 py-0.5 font-mono text-[10px]">
                   npm i -g @anthropic-ai/claude-code
+                </code>{" "}
+                then re-check.
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CodexCliStatusPill() {
+  const [state, setState] = useState<"loading" | "ok" | "err">("loading")
+  const [result, setResult] = useState<DetectResult | null>(null)
+
+  async function detect() {
+    setState("loading")
+    try {
+      const r = await invoke<DetectResult>("codex_cli_detect")
+      setResult(r)
+      setState(r.installed ? "ok" : "err")
+    } catch (e) {
+      setResult({
+        installed: false,
+        version: null,
+        path: null,
+        error: e instanceof Error ? e.message : String(e),
+      })
+      setState("err")
+    }
+  }
+
+  useEffect(() => {
+    void detect()
+  }, [])
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-2">
+        <Label className="m-0">CLI status</Label>
+        <button
+          type="button"
+          onClick={() => void detect()}
+          className="rounded border border-border px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          disabled={state === "loading"}
+        >
+          {state === "loading" ? "Checking…" : "Re-check"}
+        </button>
+      </div>
+      <div
+        className={`flex items-start gap-1.5 rounded-md border px-2 py-1.5 text-xs ${
+          state === "ok"
+            ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400"
+            : state === "err"
+              ? "border-rose-500/40 bg-rose-500/5 text-rose-700 dark:text-rose-400"
+              : "border-border bg-background/50 text-muted-foreground"
+        }`}
+      >
+        {state === "loading" && <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" />}
+        {state === "ok" && <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+        {state === "err" && <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+        <div className="min-w-0 flex-1 space-y-0.5">
+          {state === "loading" && <div>Detecting local codex binary…</div>}
+          {state === "ok" && (
+            <>
+              <div>
+                Detected{result?.version ? ` ${result.version}` : ""}. Ready to use your local
+                Codex login — no API key needed.
+              </div>
+              {result?.path && (
+                <div className="truncate font-mono text-[10px] text-muted-foreground">
+                  {result.path}
+                </div>
+              )}
+              <div className="text-muted-foreground">
+                If chat fails with an authentication error, run{" "}
+                <code className="rounded bg-background/60 px-1 py-0.5 font-mono text-[10px]">
+                  codex
+                </code>{" "}
+                in a terminal to refresh the login.
+              </div>
+            </>
+          )}
+          {state === "err" && (
+            <>
+              <div>{result?.error ?? "codex CLI not available."}</div>
+              <div className="text-muted-foreground">
+                Install from{" "}
+                <code className="rounded bg-background/60 px-1 py-0.5 font-mono text-[10px]">
+                  npm install -g @openai/codex
                 </code>{" "}
                 then re-check.
               </div>

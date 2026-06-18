@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react"
+import { useState, useCallback, useMemo } from "react"
 import {
   Link2Off,
   Unlink,
@@ -10,42 +10,77 @@ import {
   BrainCircuit,
   Wrench,
   Trash2,
+  Link,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
-import { runStructuralLint, runSemanticLint, type LintResult } from "@/lib/lint"
+import { useLintStore, type LintItem } from "@/stores/lint-store"
+import { runStructuralLint, runSemanticLint } from "@/lib/lint"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { readFile, writeFile, listDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
+import {
+  appendWikilink,
+  ensureBrokenLinkStub,
+  rewriteWikilinkTarget,
+} from "@/lib/lint-fixes"
+import { useTranslation } from "react-i18next"
 
-const typeConfig: Record<string, { icon: typeof AlertTriangle; label: string }> = {
-  orphan: { icon: Unlink, label: "Orphan Page" },
-  "broken-link": { icon: Link2Off, label: "Broken Link" },
-  "no-outlinks": { icon: ArrowUpRight, label: "No Outbound Links" },
-  semantic: { icon: BrainCircuit, label: "Semantic Issue" },
+export function groupLintResultsForDisplay(results: readonly LintItem[]): {
+  warnings: LintItem[]
+  infos: LintItem[]
+} {
+  const warnings: LintItem[] = []
+  const infos: LintItem[] = []
+
+  results.forEach((result) => {
+    if (result.severity === "warning") {
+      warnings.push(result)
+    } else {
+      infos.push(result)
+    }
+  })
+
+  return { warnings, infos }
+}
+
+export function shouldShowLintResults(hasRun: boolean, itemCount: number): boolean {
+  return hasRun || itemCount > 0
 }
 
 export function LintView() {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const llmConfig = useWikiStore((s) => s.llmConfig)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileContent = useWikiStore((s) => s.setFileContent)
-  const setActiveView = useWikiStore((s) => s.setActiveView)
+  const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
 
-  const [results, setResults] = useState<LintResult[]>([])
+  // Dynamic type config based on i18n
+  const typeConfig = useMemo(() => ({
+    orphan: { icon: Unlink, label: t("lint.typeLabels.orphan") },
+    "broken-link": { icon: Link2Off, label: t("lint.typeLabels.broken-link") },
+    "no-outlinks": { icon: ArrowUpRight, label: t("lint.typeLabels.no-outlinks") },
+    semantic: { icon: BrainCircuit, label: t("lint.typeLabels.semantic") },
+  }), [t])
+
+  const items = useLintStore((s) => s.items)
+  const addLintItems = useLintStore((s) => s.addItems)
+  const clearLintItems = useLintStore((s) => s.clearItems)
+
   const [running, setRunning] = useState(false)
   const [hasRun, setHasRun] = useState(false)
   const [runSemantic, setRunSemantic] = useState(false)
   const [fixingId, setFixingId] = useState<string | null>(null)
+  const [fixError, setFixError] = useState<string | null>(null)
 
   const handleRunLint = useCallback(async () => {
     if (!project || running) return
     const pp = normalizePath(project.path)
     setRunning(true)
-    setResults([])
+    setFixError(null)
+    clearLintItems()
     try {
       const structural = await runStructuralLint(pp)
       let all = structural
@@ -55,14 +90,14 @@ export function LintView() {
         all = [...structural, ...semantic]
       }
 
-      setResults(all)
+      addLintItems(all)
       setHasRun(true)
     } catch (err) {
       console.error("Lint failed:", err)
     } finally {
       setRunning(false)
     }
-  }, [project, llmConfig, running, runSemantic])
+  }, [project, llmConfig, running, runSemantic, addLintItems, clearLintItems])
 
   async function handleOpenPage(page: string) {
     if (!project) return
@@ -71,77 +106,91 @@ export function LintView() {
       `${pp}/wiki/${page}`,
       `${pp}/wiki/${page}.md`,
     ]
-    setActiveView("wiki")
     for (const path of candidates) {
       try {
         const content = await readFile(path)
-        setSelectedFile(path)
-        setFileContent(content)
+        openFileInPreview(path, content)
         return
       } catch {
         // try next
       }
     }
-    setSelectedFile(candidates[0])
-    setFileContent(`Unable to load: ${page}`)
+    openFileInPreview(candidates[0], `Unable to load: ${page}`)
   }
 
-  async function handleFix(result: LintResult, index: number) {
+  async function handleFix(item: LintItem) {
     if (!project) return
     const pp = normalizePath(project.path)
-    const id = `${result.type}-${index}`
-    setFixingId(id)
+    setFixingId(item.id)
+    setFixError(null)
 
     try {
-      switch (result.type) {
+      switch (item.type) {
         case "orphan": {
-          // Add a link to this page from index.md
-          const indexPath = `${pp}/wiki/index.md`
-          let indexContent = ""
-          try { indexContent = await readFile(indexPath) } catch { indexContent = "# Wiki Index\n" }
-
-          const pageName = result.page.replace(".md", "").replace(/^.*\//, "")
-          const entry = `- [[${pageName}]]`
-          if (!indexContent.includes(entry)) {
-            indexContent = indexContent.trimEnd() + "\n" + entry + "\n"
-            await writeFile(indexPath, indexContent)
+          if (item.suggestedSource) {
+            const sourcePath = `${pp}/wiki/${item.suggestedSource}`
+            const content = await readFile(sourcePath)
+            await writeFile(sourcePath, appendWikilink(content, item.page))
+          } else {
+            useReviewStore.getState().addItem({
+              type: "suggestion",
+              title: t("lint.addCrossRefs", { page: item.page }),
+              description: item.detail,
+              affectedPages: [item.page],
+              options: [
+                { label: t("lint.openEdit"), action: `open:${item.page}` },
+                { label: t("lint.skip"), action: "Skip" },
+              ],
+            })
           }
-          // Remove from results
-          setResults((prev) => prev.filter((_, i) => i !== index))
+          useLintStore.getState().removeItem(item.id)
           break
         }
 
         case "broken-link": {
-          // Option: remove the broken link from the page, or send to Review for manual fix
-          const pagePath = `${pp}/wiki/${result.page}`
-          useReviewStore.getState().addItem({
-            type: "confirm",
-            title: `Fix broken link in ${result.page}`,
-            description: result.detail,
-            affectedPages: [result.page],
-            options: [
-              { label: "Open & Edit", action: `open:${result.page}` },
-              { label: "Delete Page", action: `delete:${pagePath}` },
-              { label: "Skip", action: "Skip" },
-            ],
-          })
-          setResults((prev) => prev.filter((_, i) => i !== index))
+          const pagePath = `${pp}/wiki/${item.page}`
+          if (item.brokenTarget && item.suggestedTarget) {
+            const content = await readFile(pagePath)
+            await writeFile(pagePath, rewriteWikilinkTarget(content, item.brokenTarget, item.suggestedTarget))
+          } else if (item.brokenTarget) {
+            const content = await readFile(pagePath)
+            const stub = await ensureBrokenLinkStub(pp, item.brokenTarget)
+            await writeFile(pagePath, rewriteWikilinkTarget(content, item.brokenTarget, stub.relativePath))
+          } else {
+            useReviewStore.getState().addItem({
+              type: "confirm",
+              title: t("lint.fixBrokenLink", { page: item.page }),
+              description: item.detail,
+              affectedPages: [item.page],
+              options: [
+                { label: t("lint.openEdit"), action: `open:${item.page}` },
+                { label: t("lint.deletePage"), action: `delete:${pagePath}` },
+                { label: t("lint.skip"), action: "Skip" },
+              ],
+            })
+          }
+          useLintStore.getState().removeItem(item.id)
           break
         }
 
         case "no-outlinks": {
-          // Send to Review — user should add links manually
-          useReviewStore.getState().addItem({
-            type: "suggestion",
-            title: `Add cross-references to ${result.page}`,
-            description: "This page has no outbound [[wikilinks]]. Consider adding cross-references to related entities and concepts.",
-            affectedPages: [result.page],
-            options: [
-              { label: "Open & Edit", action: `open:${result.page}` },
-              { label: "Skip", action: "Skip" },
-            ],
-          })
-          setResults((prev) => prev.filter((_, i) => i !== index))
+          if (item.suggestedTarget) {
+            const pagePath = `${pp}/wiki/${item.page}`
+            const content = await readFile(pagePath)
+            await writeFile(pagePath, appendWikilink(content, item.suggestedTarget))
+          } else {
+            useReviewStore.getState().addItem({
+              type: "suggestion",
+              title: t("lint.addCrossRefs", { page: item.page }),
+              description: t("lint.addCrossRefsDescription"),
+              affectedPages: [item.page],
+              options: [
+                { label: t("lint.openEdit"), action: `open:${item.page}` },
+                { label: t("lint.skip"), action: "Skip" },
+              ],
+            })
+          }
+          useLintStore.getState().removeItem(item.id)
           break
         }
 
@@ -149,15 +198,15 @@ export function LintView() {
           // Semantic issues → send to Review for manual resolution
           useReviewStore.getState().addItem({
             type: "confirm",
-            title: result.detail.slice(0, 80),
-            description: result.detail,
-            affectedPages: result.affectedPages ?? [result.page],
+            title: item.detail.slice(0, 80),
+            description: item.detail,
+            affectedPages: item.affectedPages ?? [item.page],
             options: [
-              { label: "Open & Edit", action: `open:${result.page}` },
-              { label: "Skip", action: "Skip" },
+              { label: t("lint.openEdit"), action: `open:${item.page}` },
+              { label: t("lint.skip"), action: "Skip" },
             ],
           })
-          setResults((prev) => prev.filter((_, i) => i !== index))
+          useLintStore.getState().removeItem(item.id)
           break
         }
       }
@@ -168,16 +217,17 @@ export function LintView() {
       bumpDataVersion()
     } catch (err) {
       console.error("Fix failed:", err)
+      setFixError(err instanceof Error ? err.message : String(err))
     } finally {
       setFixingId(null)
     }
   }
 
-  async function handleDeleteOrphan(result: LintResult, index: number) {
+  async function handleDeleteOrphan(item: LintItem) {
     if (!project) return
     const pp = normalizePath(project.path)
-    const pagePath = `${pp}/wiki/${result.page}`
-    const confirmed = window.confirm(`Delete orphan page "${result.page}"?`)
+    const pagePath = `${pp}/wiki/${item.page}`
+    const confirmed = window.confirm(t("lint.deleteOrphanConfirm", { page: item.page }))
     if (!confirmed) return
 
     try {
@@ -191,7 +241,7 @@ export function LintView() {
         "@/lib/wiki-page-delete"
       )
       await cascadeDeleteWikiPagesWithRefs(pp, [pagePath])
-      setResults((prev) => prev.filter((_, i) => i !== index))
+      useLintStore.getState().removeItem(item.id)
       const tree = await listDirectory(pp)
       setFileTree(tree)
       bumpDataVersion()
@@ -200,17 +250,20 @@ export function LintView() {
     }
   }
 
-  const warnings = results.filter((r) => r.severity === "warning")
-  const infos = results.filter((r) => r.severity === "info")
+  const { warnings, infos } = useMemo(
+    () => groupLintResultsForDisplay(items),
+    [items],
+  )
+  const showResults = shouldShowLintResults(hasRun, items.length)
 
   return (
     <div className="flex h-full flex-col">
       <div className="shrink-0 flex items-center justify-between border-b px-4 py-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold">Wiki Lint</h2>
-          {hasRun && results.length > 0 && (
+          <h2 className="text-sm font-semibold">{t("lint.title")}</h2>
+          {showResults && items.length > 0 && (
             <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
-              {results.length} issue{results.length !== 1 ? "s" : ""}
+              {items.length === 1 ? t("lint.issues", { count: items.length }) : t("lint.issues_plural", { count: items.length })}
             </span>
           )}
         </div>
@@ -222,7 +275,7 @@ export function LintView() {
               checked={runSemantic}
               onChange={(e) => setRunSemantic(e.target.checked)}
             />
-            Semantic (LLM)
+            {t("lint.semantic")}
           </label>
           <Button
             size="sm"
@@ -230,57 +283,61 @@ export function LintView() {
             disabled={running || !project}
           >
             <RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${running ? "animate-spin" : ""}`} />
-            {running ? "Running..." : "Run Lint"}
+            {running ? t("lint.running") : t("lint.runLint")}
           </Button>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {!hasRun ? (
+        {fixError && (
+          <div className="mx-3 mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {t("lint.fixFailed", { error: fixError })}
+          </div>
+        )}
+        {!showResults ? (
           <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
             <CheckCircle2 className="h-8 w-8 text-muted-foreground/30" />
-            <p>Run lint to check wiki health</p>
-            <p className="text-xs">Checks for orphan pages, broken links, and more</p>
+            <p>{t("lint.runLintHint")}</p>
+            <p className="text-xs">{t("lint.runLintDescription")}</p>
           </div>
-        ) : results.length === 0 ? (
+        ) : items.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
             <CheckCircle2 className="h-8 w-8 text-emerald-500/60" />
-            <p className="text-emerald-600 dark:text-emerald-400 font-medium">All clear!</p>
-            <p className="text-xs">No issues found.</p>
+            <p className="text-emerald-600 dark:text-emerald-400 font-medium">{t("lint.allClear")}</p>
+            <p className="text-xs">{t("lint.noIssues")}</p>
           </div>
         ) : (
           <div className="flex flex-col gap-2 p-3">
             {warnings.length > 0 && (
-              <SectionHeader icon={AlertTriangle} label="Warnings" count={warnings.length} color="text-amber-500" />
+              <SectionHeader icon={AlertTriangle} label={t("lint.warnings")} count={warnings.length} color="text-amber-500" t={t} />
             )}
-            {warnings.map((result, i) => (
+            {warnings.map((item) => (
               <LintCard
-                key={`warn-${i}`}
-                result={result}
-                index={i}
-                fixing={fixingId === `${result.type}-${i}`}
+                key={item.id}
+                item={item}
+                fixing={fixingId === item.id}
                 onOpenPage={handleOpenPage}
                 onFix={handleFix}
-                onDelete={result.type === "orphan" ? handleDeleteOrphan : undefined}
+                onDelete={item.type === "orphan" ? handleDeleteOrphan : undefined}
+                typeConfig={typeConfig}
+                t={t}
               />
             ))}
             {infos.length > 0 && (
-              <SectionHeader icon={Info} label="Info" count={infos.length} color="text-blue-500" />
+              <SectionHeader icon={Info} label={t("lint.info")} count={infos.length} color="text-blue-500" t={t} />
             )}
-            {infos.map((result, i) => {
-              const realIndex = warnings.length + i
-              return (
-                <LintCard
-                  key={`info-${i}`}
-                  result={result}
-                  index={realIndex}
-                  fixing={fixingId === `${result.type}-${realIndex}`}
-                  onOpenPage={handleOpenPage}
-                  onFix={handleFix}
-                  onDelete={result.type === "orphan" ? handleDeleteOrphan : undefined}
-                />
-              )
-            })}
+            {infos.map((item) => (
+              <LintCard
+                key={item.id}
+                item={item}
+                fixing={fixingId === item.id}
+                onOpenPage={handleOpenPage}
+                onFix={handleFix}
+                onDelete={item.type === "orphan" ? handleDeleteOrphan : undefined}
+                typeConfig={typeConfig}
+                t={t}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -293,36 +350,40 @@ function SectionHeader({
   label,
   count,
   color,
+  t,
 }: {
   icon: typeof AlertTriangle
   label: string
   count: number
   color: string
+  t: (key: string, opts?: Record<string, unknown>) => string
 }) {
   return (
     <div className={`flex items-center gap-1.5 px-1 py-1 text-xs font-semibold ${color}`}>
       <Icon className="h-3.5 w-3.5" />
-      {label} ({count})
+      {t("lint.sectionCount", { label, count })}
     </div>
   )
 }
 
 function LintCard({
-  result,
-  index,
+  item,
   fixing,
   onOpenPage,
   onFix,
   onDelete,
+  typeConfig,
+  t,
 }: {
-  result: LintResult
-  index: number
+  item: LintItem
   fixing: boolean
   onOpenPage: (page: string) => void
-  onFix: (result: LintResult, index: number) => void
-  onDelete?: (result: LintResult, index: number) => void
+  onFix: (item: LintItem) => void
+  onDelete?: (item: LintItem) => void
+  typeConfig: Record<string, { icon: typeof AlertTriangle; label: string }>
+  t: (key: string, opts?: Record<string, unknown>) => string
 }) {
-  const config = typeConfig[result.type] ?? typeConfig.semantic
+  const config = typeConfig[item.type] ?? typeConfig.semantic
   const Icon = config.icon
 
   return (
@@ -330,20 +391,35 @@ function LintCard({
       <div className="mb-1.5 flex items-start gap-2">
         <Icon
           className={`mt-0.5 h-4 w-4 shrink-0 ${
-            result.severity === "warning" ? "text-amber-500" : "text-blue-500"
+            item.severity === "warning" ? "text-amber-500" : "text-blue-500"
           }`}
         />
         <div className="flex-1 min-w-0">
-          <div className="font-medium truncate">{result.page}</div>
+          <div className="font-medium truncate">{item.page}</div>
           <div className="text-[11px] text-muted-foreground">{config.label}</div>
         </div>
       </div>
 
-      <p className="mb-2 text-xs text-muted-foreground">{result.detail}</p>
+      <p className="mb-2 text-xs text-muted-foreground">{item.detail}</p>
 
-      {result.affectedPages && result.affectedPages.length > 0 && (
+      {(item.suggestedTarget || item.suggestedSource) && (
+        <div className="mb-2 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-2 py-1.5 text-xs text-emerald-700 dark:text-emerald-300">
+          <div className="flex items-start gap-1.5">
+            <Link className="mt-0.5 h-3 w-3 shrink-0" />
+            <div className="min-w-0">
+              <div className="font-medium">
+                {item.suggestedSource
+                  ? t("lint.suggestedSource", { page: item.suggestedSource })
+                  : t("lint.suggestedTarget", { page: item.suggestedTarget })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {item.affectedPages && item.affectedPages.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-1">
-          {result.affectedPages.map((page) => (
+          {item.affectedPages.map((page) => (
             <button
               key={page}
               type="button"
@@ -361,29 +437,29 @@ function LintCard({
           variant="outline"
           size="sm"
           className="h-6 text-xs gap-1"
-          onClick={() => onOpenPage(result.page)}
+          onClick={() => onOpenPage(item.page)}
         >
-          Open
+          {t("lint.open")}
         </Button>
         <Button
           variant="outline"
           size="sm"
           className="h-6 text-xs gap-1"
           disabled={fixing}
-          onClick={() => onFix(result, index)}
+          onClick={() => onFix(item)}
         >
           <Wrench className="h-3 w-3" />
-          {fixing ? "Fixing..." : "Fix"}
+          {fixing ? t("lint.fixing") : t("lint.fix")}
         </Button>
         {onDelete && (
           <Button
             variant="outline"
             size="sm"
             className="h-6 text-xs gap-1 text-destructive hover:text-destructive"
-            onClick={() => onDelete(result, index)}
+            onClick={() => onDelete(item)}
           >
             <Trash2 className="h-3 w-3" />
-            Delete
+            {t("lint.delete")}
           </Button>
         )}
       </div>

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import type { FileNode, WikiProject } from "@/types/wiki"
 import { ensureProjectId, upsertProjectInfo } from "@/lib/project-identity"
+import { isAbsolutePath } from "@/lib/path-utils"
 
 /** Raw shape returned by the Rust commands — id is attached client-side. */
 interface RawProject {
@@ -8,12 +9,29 @@ interface RawProject {
   path: string
 }
 
-export async function readFile(path: string): Promise<string> {
-  return invoke<string>("read_file", { path })
+export async function readFile(
+  path: string,
+  options?: { extractImages?: boolean },
+): Promise<string> {
+  return invoke<string>("read_file", {
+    path,
+    extractImages: options?.extractImages,
+  })
 }
 
 export async function writeFile(path: string, contents: string): Promise<void> {
+  assertAbsoluteFsPath("writeFile", path)
   return invoke<void>("write_file", { path, contents })
+}
+
+export async function writeFileBase64(path: string, base64: string): Promise<void> {
+  assertAbsoluteFsPath("writeFileBase64", path)
+  return invoke<void>("write_file_base64", { path, base64 })
+}
+
+export async function writeFileAtomic(path: string, contents: string): Promise<void> {
+  assertAbsoluteFsPath("writeFileAtomic", path)
+  return invoke<void>("write_file_atomic", { path, contents })
 }
 
 export async function listDirectory(path: string): Promise<FileNode[]> {
@@ -25,6 +43,13 @@ export async function copyFile(
   destination: string
 ): Promise<void> {
   return invoke("copy_file", { source, destination })
+}
+
+export async function copyDirectory(
+  source: string,
+  destination: string
+): Promise<string[]> {
+  return invoke<string[]>("copy_directory", { source, destination })
 }
 
 export async function preprocessFile(path: string): Promise<string> {
@@ -43,11 +68,30 @@ export async function findRelatedWikiPages(
 }
 
 export async function createDirectory(path: string): Promise<void> {
+  assertAbsoluteFsPath("createDirectory", path)
   return invoke<void>("create_directory", { path })
 }
 
 export async function fileExists(path: string): Promise<boolean> {
   return invoke<boolean>("file_exists", { path })
+}
+
+export async function getFileModifiedTime(path: string): Promise<number> {
+  return invoke<number>("get_file_modified_time", { path })
+}
+
+export async function getFileSize(path: string): Promise<number> {
+  return invoke<number>("get_file_size", { path })
+}
+
+export async function getFileMd5(path: string): Promise<string> {
+  return invoke<string>("get_file_md5", { path })
+}
+
+function assertAbsoluteFsPath(operation: string, path: string): void {
+  if (!isAbsolutePath(path)) {
+    throw new Error(`${operation} requires an absolute path: ${path}`)
+  }
 }
 
 /** Mirror of `commands::fs::FileBase64` (Rust side). */
@@ -83,6 +127,22 @@ export async function openProject(path: string): Promise<WikiProject> {
   return { id, name: raw.name, path: raw.path }
 }
 
+export async function openProjectFolder(path: string): Promise<void> {
+  return invoke<void>("open_project_folder", { path })
+}
+
 export async function clipServerStatus(): Promise<string> {
   return invoke<string>("clip_server_status")
+}
+
+export async function apiServerStatus(): Promise<string> {
+  return invoke<string>("api_server_status")
+}
+
+export async function apiServerReloadConfig(): Promise<string> {
+  return invoke<string>("api_server_reload_config")
+}
+
+export async function mcpServerEntryPath(): Promise<string> {
+  return invoke<string>("mcp_server_entry_path")
 }

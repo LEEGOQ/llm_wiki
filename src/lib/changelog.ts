@@ -26,6 +26,258 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.4.24",
+    date: "2026-06-16",
+    highlights: {
+      en: [
+        "Improved project creation visibility, lint repair suggestions, zoom controls, autosave, and review persistence across project switches.",
+        "Fixed vector index cleanup, Unicode page IDs, duplicate scan prefiltering, and local embedding requests so indexes and rebuilds stay accurate.",
+        "Improved MCP and local CLI provider reliability, including MCP version reporting and running Codex CLI from the project root.",
+        "Improved language prompts so technical names, model names, tool names, and code identifiers are preserved more reliably.",
+        "Hardened Windows startup with a native title bar, earlier API startup, and a visible startup-error fallback instead of a blank window.",
+      ],
+      zh: [
+        "改进项目创建字段可见性、检查修复建议、缩放控制、自动保存，以及切换项目后的待审阅项保留。",
+        "修复向量索引清理、Unicode 页面 ID、重复扫描预筛选和本地 Embedding 请求，确保索引与重建结果更准确。",
+        "改进 MCP 与本地 CLI Provider 稳定性，包括 MCP 版本显示，以及从项目根目录运行 Codex CLI。",
+        "改进语言提示词，更可靠地保留技术名、模型名、工具名和代码标识符。",
+        "增强 Windows 启动稳定性：使用原生标题栏、提前启动 API，并在前端启动失败时显示错误信息而不是白屏。",
+      ],
+    },
+  },
+  {
+    version: "0.4.23",
+    date: "2026-06-08",
+    highlights: {
+      en: [
+        "Added Doubao embedding compatibility and improved embedding rebuild safety.",
+        "Fixed dedup scan hangs, Codex CLI PATH detection from login shells, and several ingest / scheduled import reliability issues.",
+      ],
+      zh: [
+        "新增 Doubao Embedding 兼容，并提升 Embedding 重建过程的安全性。",
+        "修复去重扫描卡住、Codex CLI 登录 shell PATH 检测，以及多处摄取和定时导入稳定性问题。",
+      ],
+    },
+  },
+  {
+    version: "0.4.22",
+    date: "2026-06-08",
+    highlights: {
+      en: [
+        "Improved MinerU PDF previews by extracting images from MinerU result archives and rewriting them into Markdown image links.",
+        "Converted MinerU HTML tables inside Markdown output into Markdown tables for cleaner preview and ingest.",
+        "Hardened MinerU image handling for spaces, parentheses, path traversal, duplicate names, and partial image-save failures.",
+      ],
+      zh: [
+        "改进 MinerU PDF 预览：从 MinerU 结果压缩包提取图片，并重写为 Markdown 图片引用。",
+        "将 MinerU Markdown 输出中的 HTML 表格转换为 Markdown 表格，让预览和摄取更干净。",
+        "强化 MinerU 图片处理，覆盖空格、括号、路径穿越、重名图片和图片保存部分失败等边界。",
+      ],
+    },
+  },
+  {
+    version: "0.4.21",
+    date: "2026-06-07",
+    highlights: {
+      en: [
+        "Improved chat image support with safer local image handling, MiniMax M3 provider compatibility, and GLM vision model compatibility.",
+        "Improved MinerU PDF parsing, local CLI provider resolution, API/MCP settings, and source/image ingestion reliability.",
+        "Closed a batch of fixed GitHub issues covering source monitoring, scrolling, long-document ingest, editing, and provider compatibility.",
+      ],
+      zh: [
+        "改进 AI 对话图片支持，增强本地图片处理安全性，并扩展 MiniMax M3 Provider 与 GLM 多模态模型兼容。",
+        "优化 MinerU PDF 解析、本地 CLI Provider 解析、API/MCP 设置，以及资料与图片摄取稳定性。",
+        "集中处理并关闭一批已修复的 GitHub issue，覆盖资料监控、滚动、长文档摄取、编辑保存和 Provider 兼容。",
+      ],
+    },
+  },
+  {
+    version: "0.4.20",
+    date: "2026-06-04",
+    highlights: {
+      en: [
+        "Fixed the macOS titlebar so it keeps native window dragging while following light and dark mode.",
+      ],
+      zh: [
+        "修复 macOS 顶部标题栏：保留系统原生拖动，同时跟随亮色和暗色模式。",
+      ],
+    },
+  },
+  {
+    version: "0.4.19",
+    date: "2026-06-03",
+    highlights: {
+      en: [
+        "Fixed the macOS traffic-light titlebar drag area while keeping Windows and Linux on their native window controls.",
+      ],
+      zh: [
+        "修复 macOS 顶部红黄绿按钮区域无法拖动窗口的问题，同时保持 Windows 和 Linux 使用原生窗口控制。",
+      ],
+    },
+  },
+  {
+    version: "0.4.18",
+    date: "2026-06-03",
+    highlights: {
+      en: [
+        "Fixed close-window behavior on macOS and restored a clear Quit / Hide Window confirmation when asking before close.",
+        "Improved Linux compatibility so the window minimizes instead of hiding when system tray support is unavailable.",
+      ],
+      zh: [
+        "修复 macOS 关闭窗口行为，并在询问模式下恢复清晰的「退出 / 隐藏窗口」确认。",
+        "改进 Linux 兼容性：系统托盘不可用时改为最小化，避免窗口隐藏后无法恢复。",
+      ],
+    },
+  },
+  {
+    version: "0.4.17",
+    date: "2026-06-03",
+    highlights: {
+      en: [
+        "Added a local MCP server for agent clients, using the same project, search, graph, and file APIs as the desktop app.",
+        "Updated Settings to manage API + MCP access together, including token guidance and a copyable MCP client configuration.",
+      ],
+      zh: [
+        "新增本地 MCP 服务，方便智能体客户端通过与桌面端一致的项目、搜索、图谱和文件接口访问 LLM Wiki。",
+        "设置中新增 API + MCP 管理入口，包含访问开关、token 提示和可复制的 MCP 客户端配置。",
+      ],
+    },
+  },
+  {
+    version: "0.4.16",
+    date: "2026-05-29",
+    highlights: {
+      en: [
+        "Improved knowledge graph performance for large projects with worker-based layout and lighter rendering updates.",
+        "Fixed graph search rendering errors and stabilized graph controls during filtering and search.",
+      ],
+      zh: [
+        "优化大型项目的知识图谱性能，使用后台布局计算并减少渲染更新开销。",
+        "修复图谱搜索时的渲染报错，并提升筛选和搜索过程中的图谱稳定性。",
+      ],
+    },
+  },
+  {
+    version: "0.4.15",
+    date: "2026-05-28",
+    highlights: {
+      en: [
+        "Added AnyTXT as an external information source for Chat and Deep Research, with source labels and snippet previews.",
+        "Added legacy Word .doc support for source import, text extraction, ingest, and preview.",
+        "Improved source import, monitoring, chat search controls, graph controls, wiki generation reliability, and Mermaid rendering stability.",
+        "Fixed raw-source preview, scrolling, editing, embedding configuration, and lint persistence issues.",
+      ],
+      zh: [
+        "新增 AnyTXT 作为 AI 对话和 Deep Research 的外部信息源，并支持来源标记和片段预览。",
+        "新增旧版 Word .doc 支持，可用于资料导入、文本提取、摄取和预览。",
+        "改进资料导入与监控、对话搜索开关、关系图控制、Wiki 生成可靠性和 Mermaid 渲染稳定性。",
+        "修复原始资料预览、滚动、编辑保存、Embedding 配置和检查结果持久化相关问题。",
+      ],
+    },
+  },
+  {
+    version: "0.4.14",
+    date: "2026-05-26",
+    highlights: {
+      en: [
+        "Deep Research can now use AnyTXT local file search alongside web search, with configurable research sources.",
+        "Improved long-document ingestion with more resilient chunked analysis and follow-up research suggestions.",
+        "Fixed provider compatibility and Windows path handling issues.",
+      ],
+      zh: [
+        "Deep Research 现在可结合 AnyTXT 本地文件搜索和网页搜索，并支持配置研究信息来源。",
+        "改进长文档导入：分块分析更稳，并优化补充研究建议生成。",
+        "修复 Provider 兼容性和 Windows 路径处理相关问题。",
+      ],
+    },
+  },
+  {
+    version: "0.4.13",
+    date: "2026-05-24",
+    highlights: {
+      en: [
+        "Improved local API and search reliability, including shared backend search behavior.",
+        "Fixed source handling edge cases for nested folders, non-English paths, and Windows compatibility.",
+        "Fixed search provider configuration and Codex CLI Windows behavior issues.",
+      ],
+      zh: [
+        "改进本地 API 与搜索稳定性，包括统一后端搜索能力。",
+        "修复嵌套资料文件夹、非英文路径和 Windows 兼容相关的资料处理问题。",
+        "修复搜索 Provider 配置和 Codex CLI 在 Windows 下的体验问题。",
+      ],
+    },
+  },
+  {
+    version: "0.4.12",
+    date: "2026-05-19",
+    highlights: {
+      en: [
+        "Fixed SearXNG web search configuration so self-hosted instances work without requiring an API key.",
+      ],
+      zh: [
+        "修复 SearXNG 网页搜索配置：自托管实例不再被错误要求填写 API Key。",
+      ],
+    },
+  },
+  {
+    version: "0.4.11",
+    date: "2026-05-19",
+    highlights: {
+      en: [
+        "Added a local API server for project files, search, graph data, and source rescans, with configurable access control in Settings.",
+        "Unified UI and API search on the Rust backend with keyword and vector retrieval.",
+        "Added Knowledge Graph search with a compact expandable search control and improved empty-result stability.",
+      ],
+      zh: [
+        "新增本地 API Server，可通过接口访问项目文件、搜索、关系图数据和资料重扫，并可在设置中配置访问控制。",
+        "UI 搜索和 API 搜索统一到 Rust 后端，支持关键词与向量检索。",
+        "关系图新增搜索功能，默认使用紧凑的可展开搜索按钮，并改进无结果时的稳定性。",
+      ],
+    },
+  },
+  {
+    version: "0.4.10",
+    date: "2026-05-14",
+    highlights: {
+      en: [
+        "Added configurable source folder monitoring, manual source-folder refresh, and Gemini native embeddings support.",
+        "Fixed source sync, embedding provider compatibility, and settings localization issues.",
+      ],
+      zh: [
+        "新增可配置的资料文件夹监控、手动刷新资料文件夹，以及 Gemini 原生向量嵌入支持。",
+        "修复资料同步、向量 provider 兼容性和设置页本地化相关问题。",
+      ],
+    },
+  },
+  {
+    version: "0.4.9",
+    date: "2026-05-11",
+    highlights: {
+      en: ["Fixed Windows compatibility issues around file paths, source sync, and file deletion."],
+      zh: ["修复 Windows 下文件路径、原始资料同步和文件删除相关的兼容性问题。"],
+    },
+  },
+  {
+    version: "0.4.8",
+    date: "2026-05-11",
+    highlights: {
+      en: [
+        "Project file sync is more complete: external changes in raw sources can be detected, queued persistently, retried, and routed through the same source add/delete lifecycle as in-app actions.",
+        "Source cleanup is more reliable when raw files are deleted outside the app: related wiki pages, index entries, wikilinks, and `related:` references are cleaned consistently, including path-style `.md` links.",
+        "Web search adds SearXNG as a provider, with per-provider configuration and selectable SearXNG search categories.",
+        "Large raw-source folders are easier to browse: the Sources page now renders the file tree progressively while scrolling.",
+        "OpenAI GPT-5 / o-series ingest compatibility is improved by using the supported completion-token parameter shape and avoiding unsupported sampling knobs.",
+      ],
+      zh: [
+        "项目文件同步更完整：外部修改 raw sources 后可被检测、持久化排队、重试，并统一走应用内相同的 source 添加/删除生命周期。",
+        "外部删除原始文件后的清理更可靠：相关 wiki 页面、index 条目、正文 wikilink 和 `related:` 引用会一致清理，也覆盖带路径和 `.md` 后缀的引用。",
+        "网页搜索新增 SearXNG Provider，支持独立配置并选择 SearXNG 搜索分类。",
+        "原始资料目录较大时更易浏览：Sources 页面现在会随滚动渐进渲染文件树。",
+        "改进 OpenAI GPT-5 / o-series 的 ingest 兼容性：使用支持的 completion token 参数，并避免发送不支持的采样参数。",
+      ],
+    },
+  },
+  {
     version: "0.4.7",
     date: "2026-05-06",
     highlights: {

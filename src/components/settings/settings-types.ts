@@ -1,5 +1,5 @@
 import type { CustomApiMode } from "./llm-presets"
-import type { ReasoningConfig } from "@/stores/wiki-store"
+import type { AzureModelFamily, CloseBehavior, MineruModelVersion, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
 
 /**
  * Shape of the draft state each section reads from and writes into.
@@ -9,33 +9,42 @@ import type { ReasoningConfig } from "@/stores/wiki-store"
  */
 export interface SettingsDraft {
   // LLM provider
-  provider: "openai" | "anthropic" | "google" | "ollama" | "custom" | "minimax" | "claude-code"
+  provider: "openai" | "anthropic" | "google" | "azure" | "ollama" | "custom" | "minimax" | "claude-code" | "codex-cli"
   apiKey: string
   model: string
   ollamaUrl: string
   customEndpoint: string
+  azureApiVersion: string
+  azureModelFamily: AzureModelFamily
   maxContextSize: number
   apiMode: CustomApiMode | undefined
   reasoning: ReasoningConfig | undefined
+  localCliIsolation: boolean
 
   // Embedding
   embeddingEnabled: boolean
   embeddingEndpoint: string
   embeddingApiKey: string
   embeddingModel: string
+  /** Optional Gemini native output_dimensionality. Empty = provider default. */
+  embeddingOutputDimensionality: number | undefined
   /** Target characters per chunk. Empty = use chunker default (1000). */
   embeddingMaxChunkChars: number | undefined
   /** Overlap characters between adjacent chunks. Empty = default (200). */
   embeddingOverlapChunkChars: number | undefined
+  /** Extra HTTP headers to send on every embedding request. Empty = none. */
+  embeddingExtraHeaders: Record<string, string>
 
   // Multimodal (image captioning at ingest time)
   multimodalEnabled: boolean
   multimodalUseMainLlm: boolean
-  multimodalProvider: "openai" | "anthropic" | "google" | "ollama" | "custom" | "minimax" | "claude-code"
+  multimodalProvider: "openai" | "anthropic" | "google" | "azure" | "ollama" | "custom" | "minimax" | "claude-code" | "codex-cli"
   multimodalApiKey: string
   multimodalModel: string
   multimodalOllamaUrl: string
   multimodalCustomEndpoint: string
+  multimodalAzureApiVersion: string
+  multimodalAzureModelFamily: AzureModelFamily
   multimodalApiMode: CustomApiMode | undefined
   multimodalConcurrency: number
 
@@ -50,8 +59,33 @@ export interface SettingsDraft {
   proxyUrl: string
   proxyBypassLocal: boolean
 
+  // Scheduled Import
+  scheduledImportEnabled: boolean
+  scheduledImportPath: string
+  scheduledImportInterval: number // minutes
+
   // UI
   uiLanguage: string
+  theme: "light" | "dark" | "system"
+  zoomLevel: number
+
+  // General app behavior
+  autostart: boolean
+  closeBehavior: CloseBehavior
+
+  // Source folder auto watch
+  sourceWatchConfig: SourceWatchConfig
+
+  // MinerU PDF parsing
+  mineruEnabled: boolean
+  mineruToken: string
+  mineruModelVersion: MineruModelVersion
+
+  // Local HTTP API server
+  apiEnabled: boolean
+  apiAllowUnauthenticated: boolean
+  apiMcpEnabled: boolean
+  apiToken: string
 }
 
 export type DraftSetter = <K extends keyof SettingsDraft>(

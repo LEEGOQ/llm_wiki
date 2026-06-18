@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> | 中文
+  <a href="README.md">English</a> | 中文 | <a href="README_JA.md">日本語</a> | <a href="README_KO.md">한국어</a>
 </p>
 
 ---
@@ -32,15 +32,18 @@
 
 - **两步思维链摄入** — LLM 先分析再生成 Wiki 页面，来源可追溯，支持增量缓存
 - **多模态图片摄入** — 自动提取 PDF 内嵌图片，调用视觉模型生成事实性描述，搜索结果按图文分区，支持 lightbox 预览与跳转到原始文档对应位置
+- **可选 MinerU PDF 解析** — 可启用 MinerU 云端解析复杂 PDF（表格、公式、密集排版），默认仍使用内置本地解析
 - **四信号知识图谱** — 直接链接、来源重叠、Adamic-Adar、类型亲和四维关联度模型
 - **Louvain 社区检测** — 自动发现知识聚类，内聚度评分
 - **图谱洞察** — 惊奇连接与知识空白检测，一键触发 Deep Research
 - **向量语义搜索** — 可选的 embedding 检索，基于 LanceDB，支持任意 OpenAI 兼容端点
 - **持久化摄入队列** — 串行处理，崩溃恢复，取消/重试，进度可视化
 - **文件夹导入** — 递归导入保留目录结构，文件夹路径作为 LLM 分类上下文
-- **深度研究** — LLM 智能生成搜索主题，多查询网络搜索，研究结果自动摄入 Wiki
+- **Source 文件夹自动监听** — 检测 `raw/sources/` 的外部变更，并同步触发摄入或删除清理
+- **深度研究** — LLM 智能生成搜索主题，通过 Tavily、SerpApi 或 SearXNG 进行多查询网络搜索，研究结果自动摄入 Wiki
 - **异步审核系统** — LLM 在摄入时标记需人工判断的项，预定义操作，预生成搜索查询
 - **Chrome 网页剪藏** — 一键捕获网页内容，自动摄入知识库
+- **本地 HTTP API + MCP Server + AI Agent Skill** — 内置 `127.0.0.1:19828` JSON API 和随包提供的 MCP Server，支持 Hybrid 检索、文件读取、知识图谱遍历、源资料重新扫描；配套 [agent skill](https://github.com/nashsu/llm_wiki_skill) 一行命令接入 Claude Code / Codex（`npx skills add …`）
 
 ## 这是什么？
 
@@ -116,12 +119,14 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **SHA256 增量缓存** —— 摄入前检查源文件内容哈希，未变更则自动跳过，节省 LLM token 和时间
 - **持久化摄入队列** —— 串行处理防止并发 LLM 调用；队列持久化到磁盘，应用重启后自动恢复；失败任务自动重试最多 3 次
 - **文件夹导入** —— 递归导入保留目录结构；文件夹路径作为分类上下文传给 LLM（如 "papers > energy" 帮助分类）
+- **Source 文件夹自动监听** —— 在应用外新增、修改或删除 `raw/sources/` 文件时会被自动检测，并复用应用内相同的摄入/删除生命周期
 - **队列可视化** —— 活动面板显示进度条、排队/处理中/失败任务，支持取消和重试
 - **自动 Embedding** —— 开启向量搜索时，新页面摄入后自动生成 embedding
 - **来源可追溯** —— 每个生成的 Wiki 页面在 YAML frontmatter 中包含 `sources: []` 字段，链接回贡献的原始资料文件
 - **overview.md 自动更新** —— 全局概要页面在每次摄入后重新生成，反映 Wiki 最新状态
 - **保证资料摘要生成** —— 兜底机制确保资料摘要页面始终被创建，即使 LLM 遗漏
 - **语言感知生成** —— LLM 按用户配置的语言（中文或英文）响应
+- **资料源渐进渲染** —— 大型资料目录会随滚动分批渲染，保持 Sources 页面流畅
 
 ### 4. 知识图谱与关联度模型
 
@@ -266,7 +271,8 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 
 原始设计中没有。当 LLM 识别出知识空白时：
 
-- **网络搜索**（Tavily API）查找相关资料，返回完整内容（非截断摘要）
+- **网络搜索** 支持 Tavily、SerpApi 或 SearXNG，查找相关资料并返回完整内容（非截断摘要）
+- **Provider 独立配置** —— Tavily 和 SerpApi 使用各自 API Key；SerpApi 支持选择搜索引擎，SearXNG 使用实例 URL 和搜索分类
 - **多条搜索查询** —— 摄入时由 LLM 生成，针对搜索引擎优化
 - **LLM 智能主题生成** —— 从图谱洞察触发时，LLM 读取 overview.md + purpose.md 生成领域精准的研究主题和查询（非泛泛关键词）
 - **用户确认对话框** —— 研究主题和搜索查询可编辑，确认后才开始研究
@@ -298,13 +304,15 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 
 | 格式 | 方法 |
 |------|------|
-| PDF | pdf-extract（Rust）+ 文件缓存 |
+| PDF | 内置 pdf-extract（Rust）+ 文件缓存；可选 MinerU 云端解析表格、公式和复杂排版 |
 | DOCX | docx-rs —— 标题、加粗/斜体、列表、表格 → 结构化 Markdown |
 | PPTX | ZIP + XML —— 逐页提取，保留标题/列表结构 |
 | XLSX/XLS/ODS | calamine —— 正确的单元格类型、多工作表支持、Markdown 表格 |
 | 图片 | 原生预览（png, jpg, gif, webp, svg 等） |
 | 视频/音频 | 内置播放器 |
 | 网页剪藏 | Readability.js + Turndown.js → 干净的 Markdown |
+
+> MinerU 是可选功能。启用后 PDF 文件会上传到 MinerU 云端解析；敏感文档建议继续使用内置本地解析。若 MinerU 解析失败，LLM Wiki 会回退到内置解析。MinerU 使用受其文件大小、页数和额度限制约束。
 
 ### 15. 文件删除级联清理
 
@@ -356,12 +364,12 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 | 图谱 | sigma.js + graphology + ForceAtlas2 |
 | 搜索 | 分词搜索 + 图谱关联度 + 可选向量（LanceDB） |
 | 向量数据库 | LanceDB（Rust，嵌入式，可选） |
-| PDF | pdf-extract |
+| PDF | pdf-extract + 可选 MinerU 云端解析 |
 | Office | docx-rs + calamine |
 | 国际化 | react-i18next |
 | 状态管理 | Zustand |
 | LLM | 流式 fetch（OpenAI、Anthropic、Google、Ollama、自定义） |
-| 网络搜索 | Tavily API |
+| 网络搜索 | Tavily、SerpApi、SearXNG JSON API |
 
 ## 安装
 
@@ -394,12 +402,41 @@ npm run tauri build    # 生产构建
 
 1. 启动应用 → 创建新项目（选择模板）
 2. 进入 **设置** → 配置 LLM 提供商（API 密钥 + 模型）
-3. 进入 **资料源** → 导入文档（PDF、DOCX、MD 等）
-4. 观察 **活动面板** —— LLM 自动构建 Wiki 页面
-5. 使用 **聊天** 查询你的知识库
-6. 浏览 **知识图谱** 查看关联
-7. 查看 **审核** 处理需要你关注的项目
-8. 定期运行 **Lint** 维护 Wiki 健康度
+3. 可选：在 **设置** 中配置网络搜索 Provider 和 source 文件夹自动监听
+4. 进入 **资料源** → 导入文档（PDF、DOCX、MD 等）
+5. 观察 **活动面板** —— LLM 自动构建 Wiki 页面
+6. 使用 **聊天** 查询你的知识库
+7. 浏览 **知识图谱** 查看关联
+8. 查看 **审核** 处理需要你关注的项目
+9. 定期运行 **Lint** 维护 Wiki 健康度
+
+## 本地 HTTP API + MCP Server + AI Agent Skill
+
+LLM Wiki 内置一个本地 HTTP API（监听 `http://127.0.0.1:19828`，Token 鉴权，仅本机可达），任何外部工具——包括 **Claude Code**、**Codex** 这类 AI Agent，或者任意能发 HTTP 请求的脚本——都可以直接查询你的知识库：
+
+- `GET /api/v1/health` —— 服务状态（无需鉴权）
+- `GET /api/v1/projects` —— 项目列表
+- `GET /api/v1/projects/{id}/files` / `files/content` —— 读取文件树与内容
+- `POST /api/v1/projects/{id}/search` —— **Hybrid 混合检索**（关键词 + 向量），返回 `mode`、`tokenHits`、`vectorHits`，每条结果带 `vectorScore`
+- `GET /api/v1/projects/{id}/graph` —— Wikilinks 知识图谱
+- `POST /api/v1/projects/{id}/sources/rescan` —— 触发后端重新扫描
+
+在 **设置 → API + MCP** 中开启 API、生成 Token，并按需选择是否允许本机无鉴权访问。
+
+对于兼容 MCP 的客户端，LLM Wiki 还内置了 `mcp-server/`。执行 `npm run mcp:build` 构建后，**设置 → API + MCP** 会展示一份可复制的 MCP 客户端配置，并自动填入当前机器上的真实入口路径。MCP 工具复用同一套 API 能力，因此 Agent 可以直接列出项目、读取文件、执行 Hybrid 检索、查看图谱和触发资料源重新扫描，不需要再手写 HTTP 调用。
+
+### 一条命令把 AI Agent 接进你的知识库
+
+LLM Wiki 配套的 **agent skill** 单独维护在另一个仓库。把它装进 Claude Code / Codex / 任意兼容 skills 的 runtime：
+
+```bash
+npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm_wiki_skill
+```
+
+安装完成后，Agent 就能响应 "我的 LLM Wiki 里关于 X 是怎么说的"、"在我的知识库里搜 Y"、"展示我 wiki 图谱里 Z 的邻居"、"重新索引我的资料源" 等请求——直接调用本机运行的 App，默认只读，引用 wiki 页面路径方便你在 App 内核对。
+
+- **Skill 仓库**：<https://github.com/nashsu/llm_wiki_skill>
+- **触发约束**：刻意**不会**响应"搜我的笔记"/"看我的 Obsidian / Notion / Logseq"这类泛指的请求——只有你明确说 LLM Wiki / `我的 wiki` / `我的知识库` 时才会被调用。
 
 ## 项目结构
 

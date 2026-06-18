@@ -1,9 +1,10 @@
 import type { LlmConfig } from "@/stores/wiki-store"
+import { isAzureOpenAiEndpoint } from "@/lib/azure-openai"
 import { getProviderConfig, type RequestOverrides } from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
 import { countReasoningCharsInLine, extractReasoningTextFromLine } from "./reasoning-detector"
 
-export type { ChatMessage, RequestOverrides } from "./llm-providers"
+export type { ChatMessage, ContentBlock, RequestOverrides } from "./llm-providers"
 export { isFetchNetworkError } from "./tauri-fetch"
 
 export interface StreamCallbacks {
@@ -26,6 +27,17 @@ async function streamViaClaudeCodeCli(
   return mod.streamClaudeCodeCli(config, messages, callbacks, signal, requestOverrides)
 }
 
+async function streamViaCodexCli(
+  config: LlmConfig,
+  messages: import("./llm-providers").ChatMessage[],
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+  requestOverrides?: RequestOverrides,
+) {
+  const mod = await import("./codex-cli-transport")
+  return mod.streamCodexCli(config, messages, callbacks, signal, requestOverrides)
+}
+
 const DECODER = new TextDecoder()
 
 function parseLines(chunk: Uint8Array, buffer: string): [string[], string] {
@@ -33,6 +45,11 @@ function parseLines(chunk: Uint8Array, buffer: string): [string[], string] {
   const lines = text.split("\n")
   const remaining = lines.pop() ?? ""
   return [lines, remaining]
+}
+
+function isRequestCancelledError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /^request cancel(?:l)?ed$/i.test(message.trim())
 }
 
 export async function streamChat(
@@ -57,6 +74,10 @@ export async function streamChat(
   // this provider because it has no URL/headers.
   if (config.provider === "claude-code") {
     return streamViaClaudeCodeCli(config, messages, callbacks, signal, requestOverrides)
+  }
+
+  if (config.provider === "codex-cli") {
+    return streamViaCodexCli(config, messages, callbacks, signal, requestOverrides)
   }
 
   const providerConfig = getProviderConfig(config)
@@ -103,7 +124,7 @@ export async function streamChat(
       onDone()
       return
     }
-    if (err instanceof Error && err.name === "AbortError") {
+    if ((err instanceof Error && err.name === "AbortError") || isRequestCancelledError(err)) {
       // Backstop timeout aborted the request (we tracked this via
       // timeoutFired); treat it as a real timeout rather than a cancel.
       if (timeoutFired) {
@@ -136,6 +157,21 @@ export async function streamChat(
       if (body) errorDetail += ` — ${body}`
     } catch {
       // ignore body read failure
+    }
+    if (
+      response.status === 404 &&
+      (config.provider === "azure" ||
+        (config.provider === "custom" && isAzureOpenAiEndpoint(config.customEndpoint)))
+    ) {
+      onError(
+        new Error(
+          `${errorDetail} — Azure 404 usually means the deployment name is wrong. ` +
+            `Set Model to your Azure deployment name (not the model SKU), ` +
+            `and Endpoint to https://<resource>.openai.azure.com ` +
+            `or .../openai/deployments/<deployment-name>.`,
+        ),
+      )
+      return
     }
     onError(new Error(errorDetail))
     return
@@ -225,7 +261,23 @@ export async function streamChat(
 
     onDone()
   } catch (err) {
-    if (err instanceof Error && (err.name === "AbortError" || (signal?.aborted))) {
+    // The abort can reach us two ways: a real AbortError, or — when the
+    // Tauri HTTP plugin tears down the body stream — a bare *string*
+    // "Request cancelled" passed to controller.error(). The latter is not
+    // an Error, so the old `err instanceof Error` guard let it fall through
+    // to the generic branch and surface verbatim. Recognize both shapes.
+    const isAbort =
+      signal?.aborted ||
+      timeoutFired ||
+      (err instanceof Error && err.name === "AbortError") ||
+      isRequestCancelledError(err)
+    if (isAbort) {
+      // Mirror the pre-fetch catch: distinguish our long-horizon backstop
+      // (an actionable timeout) from a user-initiated cancel (silent).
+      if (timeoutFired) {
+        onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
+        return
+      }
       onDone()
       return
     }

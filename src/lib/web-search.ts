@@ -1,5 +1,12 @@
-import type { SearchApiConfig, SearchProvider, SearchProviderConfigs, SerpApiEngine } from "@/stores/wiki-store"
+import type {
+  SearchApiConfig,
+  SearchProvider,
+  SearchProviderConfigs,
+  SearXngCategory,
+  SerpApiEngine,
+} from "@/stores/wiki-store"
 import { getHttpFetch, isFetchNetworkError } from "@/lib/tauri-fetch"
+import { hasConfiguredAnyTxt, normalizeAnyTxtConfig } from "@/lib/anytxt-search"
 
 export interface WebSearchResult {
   title: string
@@ -20,32 +27,108 @@ export const SERPAPI_ENGINE_OPTIONS: { value: SerpApiEngine; label: string; hint
   { value: "youtube", label: "YouTube", hint: "YouTube video results" },
 ]
 
+export const SEARXNG_CATEGORY_OPTIONS: { value: SearXngCategory; label: string; hint: string }[] = [
+  { value: "general", label: "General", hint: "Default web results" },
+  { value: "news", label: "News", hint: "News engines" },
+  { value: "science", label: "Science", hint: "Academic and science-focused engines" },
+  { value: "it", label: "IT", hint: "Developer and technology engines" },
+  { value: "images", label: "Images", hint: "Image search results" },
+  { value: "videos", label: "Videos", hint: "Video search results" },
+  { value: "files", label: "Files", hint: "File and document search" },
+  { value: "map", label: "Map", hint: "Map and location results" },
+  { value: "music", label: "Music", hint: "Music engines" },
+  { value: "social media", label: "Social", hint: "Social media engines" },
+]
+
 export function resolveSearchConfig(config: SearchApiConfig): SearchApiConfig {
   const providerConfigs: SearchProviderConfigs = config.providerConfigs ?? {
-    ...(config.provider !== "none" && config.apiKey
-      ? { [config.provider]: { apiKey: config.apiKey, serpApiEngine: config.serpApiEngine } }
+    ...(config.provider !== "none" && config.provider !== "ollama" && config.provider !== "firecrawl" && config.apiKey
+      ? {
+          [config.provider]: {
+            apiKey: config.apiKey,
+            serpApiEngine: config.serpApiEngine,
+            searXngUrl: config.searXngUrl,
+            searXngCategories: config.searXngCategories,
+          },
+        }
+      : {}),
+    ...(config.provider === "searxng" && config.searXngUrl
+      ? {
+          searxng: {
+            searXngUrl: config.searXngUrl,
+            searXngCategories: config.searXngCategories,
+          },
+        }
+      : {}),
+    ...(config.provider === "ollama" && config.ollamaUrl
+      ? {
+          ollama: {
+            ollamaUrl: config.ollamaUrl,
+          },
+        }
       : {}),
   }
 
   const activeProvider = config.provider as SearchProvider
+  const activeOverride = activeProvider === "none" ? undefined : providerConfigs[activeProvider]
+  const resolvedOllamaUrl =
+    activeProvider === "ollama"
+      ? activeOverride?.ollamaUrl ?? config.ollamaUrl ?? "https://ollama.com"
+      : providerConfigs.ollama?.ollamaUrl ?? "https://ollama.com"
+
   if (activeProvider === "none") {
     return {
       ...config,
       provider: "none",
       apiKey: "",
       serpApiEngine: config.serpApiEngine ?? providerConfigs.serpapi?.serpApiEngine ?? "google",
+      searXngUrl: config.searXngUrl ?? providerConfigs.searxng?.searXngUrl ?? "",
+      searXngCategories: config.searXngCategories ?? providerConfigs.searxng?.searXngCategories ?? ["general"],
+      ollamaUrl: providerConfigs.ollama?.ollamaUrl ?? "https://ollama.com",
       providerConfigs,
+      deepResearchSource: config.deepResearchSource ?? "web",
+      anyTxt: normalizeAnyTxtConfig(config.anyTxt),
     }
   }
 
-  const activeOverride = providerConfigs[activeProvider]
   return {
     ...config,
     provider: activeProvider,
     apiKey: activeOverride?.apiKey ?? config.apiKey ?? "",
     serpApiEngine: activeOverride?.serpApiEngine ?? config.serpApiEngine ?? "google",
+    searXngUrl: activeOverride?.searXngUrl ?? config.searXngUrl ?? "",
+    searXngCategories: activeOverride?.searXngCategories ?? config.searXngCategories ?? ["general"],
+    ollamaUrl: resolvedOllamaUrl,
     providerConfigs,
+    deepResearchSource: config.deepResearchSource ?? "web",
+    anyTxt: normalizeAnyTxtConfig(config.anyTxt),
   }
+}
+
+export function hasConfiguredSearchProvider(config: SearchApiConfig): boolean {
+  const resolved = resolveSearchConfig(config)
+  if (resolved.provider === "none") return false
+  if (resolved.provider === "searxng") {
+    return Boolean(resolved.searXngUrl?.trim())
+  }
+  if (resolved.provider === "ollama") {
+    return Boolean(resolved.apiKey?.trim())
+  }
+  if (resolved.provider === "firecrawl") {
+    return true
+  }
+  return Boolean(resolved.apiKey?.trim())
+}
+
+export function hasConfiguredDeepResearchSources(config: SearchApiConfig): boolean {
+  const resolved = resolveSearchConfig(config)
+  const source = resolved.deepResearchSource ?? "web"
+  const webConfigured = hasConfiguredSearchProvider(resolved)
+  const anyTxtConfigured = hasConfiguredAnyTxt(resolved.anyTxt)
+
+  if (source === "web") return webConfigured
+  if (source === "anytxt") return anyTxtConfigured
+  return webConfigured || anyTxtConfigured
 }
 
 export async function webSearch(
@@ -54,8 +137,17 @@ export async function webSearch(
   maxResults: number = 10,
 ): Promise<WebSearchResult[]> {
   const resolved = resolveSearchConfig(config)
-  if (resolved.provider === "none" || !resolved.apiKey) {
-    throw new Error("Web search not configured. Add a Tavily or SerpApi API key in Settings.")
+  if (resolved.provider === "none") {
+    throw new Error("Web search not configured. Select a search provider in Settings.")
+  }
+  if ((resolved.provider === "tavily" || resolved.provider === "serpapi") && !resolved.apiKey) {
+    throw new Error("Web search not configured. Add a Tavily or SerpApi API key in Settings, or select a key-free provider such as Firecrawl or SearXNG.")
+  }
+  if (resolved.provider === "searxng" && !resolved.searXngUrl?.trim()) {
+    throw new Error("Web search not configured. Add a SearXNG instance URL in Settings.")
+  }
+  if (resolved.provider === "ollama" && !resolved.apiKey?.trim()) {
+    throw new Error("Ollama Web Search API requires an Ollama API key. Add one in Settings.")
   }
 
   switch (resolved.provider) {
@@ -63,8 +155,93 @@ export async function webSearch(
       return tavilySearch(query, resolved.apiKey, maxResults)
     case "serpapi":
       return serpApiSearch(query, resolved.apiKey, maxResults, resolved.serpApiEngine ?? "google")
+    case "searxng":
+      return searXngSearch(query, resolved.searXngUrl ?? "", maxResults, resolved.searXngCategories ?? ["general"])
+    case "ollama":
+      return ollamaSearch(query, resolved.apiKey ?? "", maxResults)
+    case "firecrawl":
+      return firecrawlSearch(query, maxResults)
     default:
       throw new Error(`Unknown search provider: ${resolved.provider}`)
+  }
+}
+
+function searXngSearchUrl(instanceUrl: string): URL {
+  const trimmed = instanceUrl.trim()
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+  const url = new URL(withProtocol)
+  const path = url.pathname.replace(/\/+$/, "")
+  url.pathname = path.endsWith("/search") || path === "/search"
+    ? path
+    : `${path}/search`
+  url.search = ""
+  url.hash = ""
+  return url
+}
+
+async function searXngSearch(
+  query: string,
+  instanceUrl: string,
+  maxResults: number,
+  categories: SearXngCategory[],
+): Promise<WebSearchResult[]> {
+  let endpoint: URL
+  try {
+    endpoint = searXngSearchUrl(instanceUrl)
+  } catch {
+    throw new Error("Invalid SearXNG instance URL. Use a valid http(s) URL, for example https://search.example.com.")
+  }
+
+  endpoint.searchParams.set("q", query)
+  endpoint.searchParams.set("format", "json")
+  endpoint.searchParams.set("categories", (categories.length > 0 ? categories : ["general"]).join(","))
+
+  const httpFetch = await getHttpFetch()
+  let response: Response
+  try {
+    response = await httpFetch(endpoint.toString(), {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    })
+  } catch (err) {
+    if (isFetchNetworkError(err)) {
+      throw new Error(
+        "Network error reaching the SearXNG instance. Check the instance URL and whether JSON search is enabled.",
+      )
+    }
+    throw err
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "Unknown error")
+    throw new Error(`SearXNG search failed (${response.status}): ${errorText}`)
+  }
+
+  const data = await response.json()
+  return normalizeSearXngResults(data, maxResults)
+}
+
+function normalizeSearXngResults(data: { results?: unknown[] }, maxResults: number): WebSearchResult[] {
+  return (data.results ?? [])
+    .slice(0, maxResults)
+    .map((item) => normalizeSearXngResult(item))
+    .filter((item) => item.url.length > 0)
+}
+
+function normalizeSearXngResult(item: unknown): WebSearchResult {
+  const r = item as {
+    title?: string
+    url?: string
+    content?: string
+    engine?: string
+    category?: string
+  }
+  const url = r.url ?? ""
+  return {
+    title: r.title ?? "Untitled",
+    url,
+    snippet: r.content ?? "",
+    source: hostnameFromUrl(url) || r.engine || r.category || "",
   }
 }
 
@@ -120,6 +297,105 @@ async function tavilySearch(
     snippet: r.content ?? "",
     source: hostnameFromUrl(r.url ?? ""),
   }))
+}
+
+interface FirecrawlSearchResponse {
+  success?: boolean
+  error?: string
+  data?: unknown[]
+  results?: unknown[]
+}
+
+async function firecrawlSearch(
+  query: string,
+  maxResults: number,
+): Promise<WebSearchResult[]> {
+  const httpFetch = await getHttpFetch()
+  let response: Response
+  try {
+    response = await httpFetch("https://api.firecrawl.dev/v2/search", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        limit: maxResults,
+      }),
+    })
+  } catch (err) {
+    if (isFetchNetworkError(err)) {
+      throw new Error(
+        "Network error reaching Firecrawl Search. Check your connectivity or choose another Web Search provider.",
+      )
+    }
+    throw err
+  }
+
+  const text = await response.text().catch(() => "")
+  let data: FirecrawlSearchResponse = {}
+  try {
+    data = text ? JSON.parse(text) as FirecrawlSearchResponse : {}
+  } catch {
+    if (!response.ok) {
+      throw new Error(`Firecrawl search failed (${response.status}): ${text || "Unknown error"}`)
+    }
+    throw new Error("Firecrawl search returned an invalid JSON response.")
+  }
+
+  if (!response.ok) {
+    throw new Error(friendlyFirecrawlError(data.error) ?? `Firecrawl search failed (${response.status}): ${text || "Unknown error"}`)
+  }
+
+  if (data.success === false || (data.success !== true && typeof data.error === "string" && data.error.trim())) {
+    throw new Error(friendlyFirecrawlError(data.error) ?? `Firecrawl search failed: ${data.error ?? "Unknown error"}`)
+  }
+
+  return normalizeFirecrawlResults(data, maxResults)
+}
+
+function friendlyFirecrawlError(error?: string): string | null {
+  const message = error?.trim()
+  if (!message) return null
+  if (/suspicious|without an API key|firecrawl can't be used without an api key/i.test(message)) {
+    return "Firecrawl anonymous search is blocked for this IP. Firecrawl says this network looks suspicious; choose another Web Search provider or try a different network."
+  }
+  return `Firecrawl search failed: ${message}`
+}
+
+function normalizeFirecrawlResults(data: FirecrawlSearchResponse, maxResults: number): WebSearchResult[] {
+  const rawResults = data.data ?? data.results ?? []
+  return rawResults
+    .slice(0, maxResults)
+    .map((item) => normalizeFirecrawlResult(item))
+    .filter((item) => item.url.length > 0)
+}
+
+function normalizeFirecrawlResult(item: unknown): WebSearchResult {
+  const r = item as {
+    title?: string
+    url?: string
+    link?: string
+    markdown?: string
+    content?: string
+    description?: string
+    snippet?: string
+    source?: string
+    metadata?: {
+      title?: string
+      sourceURL?: string
+      url?: string
+      description?: string
+    }
+  }
+  const url = r.url ?? r.link ?? r.metadata?.sourceURL ?? r.metadata?.url ?? ""
+  return {
+    title: r.title ?? r.metadata?.title ?? "Untitled",
+    url,
+    snippet: r.snippet ?? r.description ?? r.metadata?.description ?? r.content ?? r.markdown ?? "",
+    source: hostnameFromUrl(url) || r.source || "",
+  }
 }
 
 async function serpApiSearch(
@@ -206,4 +482,78 @@ function normalizeSerpApiResult(item: unknown): WebSearchResult {
     snippet: r.snippet ?? r.summary ?? r.description ?? "",
     source: hostnameFromUrl(url) || r.source || r.displayed_link || "",
   }
+}
+
+interface OllamaSearchResponse {
+  results?: Array<{
+    title?: string
+    url?: string
+    content?: string
+  }>
+  error?: string
+}
+
+async function ollamaSearch(
+  query: string,
+  apiKey: string,
+  maxResults: number,
+): Promise<WebSearchResult[]> {
+  const trimmedApiKey = apiKey.trim()
+  if (!trimmedApiKey) {
+    throw new Error("Ollama Web Search API requires an Ollama API key. Add one in Settings.")
+  }
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${trimmedApiKey}`,
+  }
+
+  const httpFetch = await getHttpFetch()
+  let response: Response
+  try {
+    response = await httpFetch("https://ollama.com/api/web_search", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        query,
+        max_results: maxResults,
+      }),
+    })
+  } catch (err) {
+    if (isFetchNetworkError(err)) {
+      throw new Error(
+        "Network error reaching the Ollama Web Search API. Check your connectivity and whether the Ollama API key is still valid.",
+      )
+    }
+    throw err
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error(
+        "Ollama Web Search API authentication failed. Check your Ollama API key.",
+      )
+    }
+    const errorText = await response.text().catch(() => "Unknown error")
+    throw new Error(`Ollama web search failed (${response.status}): ${errorText}`)
+  }
+
+  const data = (await response.json()) as OllamaSearchResponse
+
+  if (data.error) {
+    throw new Error(`Ollama web search error: ${data.error}`)
+  }
+
+  return (data.results ?? [])
+    .slice(0, maxResults)
+    .map((r) => {
+      const url = r.url ?? ""
+      return {
+        title: r.title ?? "Untitled",
+        url,
+        snippet: r.content ?? "",
+        source: hostnameFromUrl(url),
+      }
+    })
 }

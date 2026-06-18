@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { LLM_PRESETS } from "./llm-presets"
 import { resolveConfig } from "./preset-resolver"
 import type { LlmConfig } from "@/stores/wiki-store"
 import type { LlmPreset } from "./llm-presets"
@@ -17,6 +18,37 @@ function fallbackConfig(overrides: Partial<LlmConfig> = {}): LlmConfig {
 }
 
 describe("resolveConfig", () => {
+  it("keeps DeepSeek presets aligned with the current V4 model list", () => {
+    const deepseek = LLM_PRESETS.find((preset) => preset.id === "deepseek")
+
+    expect(deepseek?.defaultModel).toBe("deepseek-v4-flash")
+    expect(deepseek?.suggestedModels).toEqual([
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "deepseek-chat",
+      "deepseek-reasoner",
+    ])
+  })
+
+  it("keeps Xiaomi MiMo presets aligned with current official and Token Plan endpoints", () => {
+    const mimo = LLM_PRESETS.find((preset) => preset.id === "xiaomi-mimo")
+
+    expect(mimo?.defaultModel).toBe("mimo-v2.5-pro")
+    expect(mimo?.suggestedContextSize).toBe(1000000)
+    expect(mimo?.baseUrl).toBe("https://api.xiaomimimo.com/v1")
+    expect(mimo?.baseUrlByMode).toEqual({
+      chat_completions: "https://token-plan-cn.xiaomimimo.com/v1",
+      anthropic_messages: "https://token-plan-cn.xiaomimimo.com/anthropic",
+    })
+    expect(mimo?.suggestedModels).toEqual([
+      "mimo-v2.5-pro",
+      "mimo-v2.5",
+      "mimo-v2-flash",
+      "mimo-v2-pro",
+      "mimo-v2-omni",
+    ])
+  })
+
   it("defaults reasoning to auto instead of inheriting another preset's fallback", () => {
     const preset: LlmPreset = {
       id: "deepseek",
@@ -49,5 +81,85 @@ describe("resolveConfig", () => {
     )
 
     expect(resolved.reasoning).toEqual({ mode: "off" })
+  })
+
+  it("carries Azure API version and model family overrides", () => {
+    const preset: LlmPreset = {
+      id: "azure",
+      label: "Azure OpenAI",
+      provider: "azure",
+      baseUrl: "https://resource.openai.azure.com",
+      defaultModel: "wiki-main",
+      azureApiVersion: "2024-10-21",
+    }
+
+    const resolved = resolveConfig(
+      preset,
+      { azureApiVersion: "2025-01-01-preview", azureModelFamily: "gpt5" },
+      fallbackConfig(),
+    )
+
+    expect(resolved.azureApiVersion).toBe("2025-01-01-preview")
+    expect(resolved.azureModelFamily).toBe("gpt5")
+  })
+
+  it("carries local CLI isolation for Claude Code and Codex CLI presets", () => {
+    const preset: LlmPreset = {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex-cli",
+      defaultModel: "gpt-5",
+    }
+
+    const resolved = resolveConfig(
+      preset,
+      { localCliIsolation: true },
+      fallbackConfig(),
+    )
+
+    expect(resolved.localCliIsolation).toBe(true)
+  })
+
+  it("carries Codex CLI timeout only for the Codex CLI preset", () => {
+    const codexPreset: LlmPreset = {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex-cli",
+      defaultModel: "gpt-5",
+    }
+    const claudePreset: LlmPreset = {
+      id: "claude-code-cli",
+      label: "Claude Code CLI",
+      provider: "claude-code",
+      defaultModel: "sonnet",
+    }
+
+    expect(resolveConfig(
+      codexPreset,
+      { codexCliTimeoutMinutes: 9999 },
+      fallbackConfig(),
+    ).codexCliTimeoutMinutes).toBe(240)
+    expect(resolveConfig(
+      claudePreset,
+      { codexCliTimeoutMinutes: 45 },
+      fallbackConfig(),
+    ).codexCliTimeoutMinutes).toBeUndefined()
+  })
+
+  it("does not apply local CLI isolation to hosted providers", () => {
+    const preset: LlmPreset = {
+      id: "openai",
+      label: "OpenAI",
+      provider: "openai",
+      defaultModel: "gpt-5",
+    }
+
+    const resolved = resolveConfig(
+      preset,
+      { localCliIsolation: true },
+      fallbackConfig({ localCliIsolation: true }),
+    )
+
+    expect(resolved.localCliIsolation).toBe(false)
   })
 })

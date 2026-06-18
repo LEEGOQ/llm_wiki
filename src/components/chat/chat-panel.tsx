@@ -1,22 +1,39 @@
 import { useRef, useEffect, useCallback, useState } from "react"
+import { useTranslation } from "react-i18next"
 import { BookOpen, Plus, Trash2, MessageSquare } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ChatMessage, StreamingMessage, useSourceFiles } from "./chat-message"
-import { ChatInput } from "./chat-input"
-import { useChatStore, chatMessagesToLLM } from "@/stores/chat-store"
+import { ChatInput, type ChatSendOptions } from "./chat-input"
+import { useChatStore, chatMessagesToLLM, type MessageReference, type MessageImage } from "@/stores/chat-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage as LLMMessage } from "@/lib/llm-client"
+import { supportsImageInput } from "@/lib/llm-providers"
 import { executeIngestWrites } from "@/lib/ingest"
 import { listDirectory, readFile, deleteFile } from "@/commands/fs"
 import { searchWiki } from "@/lib/search"
 import { buildRetrievalGraph, getRelatedNodes } from "@/lib/graph-relevance"
 import { normalizePath, getFileName, getRelativePath } from "@/lib/path-utils"
-import { getOutputLanguage, buildLanguageReminder } from "@/lib/output-language"
+import { buildLanguageDirective, buildLanguageReminder } from "@/lib/output-language"
 import { isGreeting } from "@/lib/greeting-detector"
 import { computeContextBudget } from "@/lib/context-budget"
+import { anyTxtSearchSmart, hasConfiguredAnyTxt } from "@/lib/anytxt-search"
+import { resolveSearchConfig, webSearch, type WebSearchResult } from "@/lib/web-search"
 
 // Store the page mapping from the last query so SourceFilesBar can show which pages were cited
 export let lastQueryPages: { title: string; path: string }[] = []
+
+function formatExternalSearchContext(results: WebSearchResult[]): string {
+  if (results.length === 0) return ""
+  return results
+    .map((result, index) => [
+      `### [E${index + 1}] ${result.title}`,
+      `Source: ${result.source}`,
+      `URL: ${result.url}`,
+      "",
+      result.snippet,
+    ].join("\n"))
+    .join("\n\n---\n\n")
+}
 
 function formatDate(timestamp: number): string {
   const d = new Date(timestamp)
@@ -29,6 +46,7 @@ function formatDate(timestamp: number): string {
 }
 
 function ConversationSidebar() {
+  const { t } = useTranslation()
   const conversations = useChatStore((s) => s.conversations)
   const activeConversationId = useChatStore((s) => s.activeConversationId)
   const messages = useChatStore((s) => s.messages)
@@ -54,14 +72,14 @@ function ConversationSidebar() {
           onClick={() => createConversation()}
         >
           <Plus className="h-3.5 w-3.5" />
-          New Chat
+          {t("chat.newChat")}
         </Button>
       </div>
 
       <div className="flex-1 overflow-y-auto py-1">
         {sorted.length === 0 ? (
           <p className="px-3 py-4 text-xs text-muted-foreground text-center">
-            No conversations yet
+            {t("chat.noConversationsYet")}
           </p>
         ) : (
           sorted.map((conv) => {
@@ -105,7 +123,7 @@ function ConversationSidebar() {
                   {msgCount > 0 && (
                     <>
                       <span>·</span>
-                      <span>{msgCount} msgs</span>
+                      <span>{msgCount} {t("chat.msgCount")}</span>
                     </>
                   )}
                 </div>
@@ -119,6 +137,7 @@ function ConversationSidebar() {
 }
 
 export function ChatPanel() {
+  const { t } = useTranslation()
   useSourceFiles() // Keep source file cache warm
   const activeConversationId = useChatStore((s) => s.activeConversationId)
   const isStreaming = useChatStore((s) => s.isStreaming)
@@ -140,6 +159,9 @@ export function ChatPanel() {
 
   const project = useWikiStore((s) => s.project)
   const llmConfig = useWikiStore((s) => s.llmConfig)
+  const searchApiConfig = useWikiStore((s) => s.searchApiConfig)
+  const anyTxtAvailable = hasConfiguredAnyTxt(searchApiConfig.anyTxt)
+  const imageInputAvailable = supportsImageInput(llmConfig)
   const setFileTree = useWikiStore((s) => s.setFileTree)
 
   const abortRef = useRef<AbortController | null>(null)
@@ -155,19 +177,23 @@ export function ChatPanel() {
   }, [activeMessages, streamingContent])
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (
+      text: string,
+      images: MessageImage[] = [],
+      options: ChatSendOptions = { useWebSearch: false, useAnyTxtSearch: false },
+    ) => {
       // Auto-create a conversation if none is active
       let convId = useChatStore.getState().activeConversationId
       if (!convId) {
         convId = createConversation()
       }
 
-      addMessage("user", text)
+      addMessage("user", text, images)
       setStreaming(true)
 
       // Build system prompt with wiki context using graph-enhanced retrieval
       const systemMessages: LLMMessage[] = []
-      let queryRefs: { title: string; path: string }[] = []
+      let queryRefs: MessageReference[] = []
       let langReminder: string | undefined
       // Pure greetings ("hi", "你好", "嗨") don't warrant running the whole
       // retrieval pipeline — it's slow, costs context, and drags in random
@@ -175,7 +201,6 @@ export function ChatPanel() {
       // minimal system prompt and let the model reply conversationally.
       const greetingOnly = isGreeting(text)
       if (project && greetingOnly) {
-        const outLang = getOutputLanguage(text)
         systemMessages.push({
           role: "system",
           content: [
@@ -183,7 +208,7 @@ export function ChatPanel() {
             "The user sent a casual greeting — reply briefly and naturally, in one or two sentences.",
             "Do NOT invent wiki content or pretend to have retrieved pages. Invite the user to ask a concrete question if they want information from the wiki.",
             "",
-            `Respond in ${outLang}.`,
+            buildLanguageReminder(text),
           ].join("\n"),
         })
         // Skip retrieval; queryRefs stays empty so no "Sources" chip is shown.
@@ -209,6 +234,45 @@ export function ChatPanel() {
         // ── Phase 1: Tokenized search → top 10 ────────────────
         const searchResults = await searchWiki(pp, text)
         const topSearchResults = searchResults.slice(0, 10)
+
+        const resolvedExternalSearchConfig = resolveSearchConfig(searchApiConfig)
+        const externalSearchResults: WebSearchResult[] = []
+        const externalSearchErrors: string[] = []
+        const externalCalls: Promise<WebSearchResult[]>[] = []
+
+        if (options.useWebSearch) {
+          externalCalls.push(
+            webSearch(text, resolvedExternalSearchConfig, 5).catch((err) => {
+              externalSearchErrors.push(
+                `Web Search: ${err instanceof Error ? err.message : String(err)}`,
+              )
+              return []
+            }),
+          )
+        }
+
+        if (options.useAnyTxtSearch) {
+          externalCalls.push(
+            anyTxtSearchSmart(text, resolvedExternalSearchConfig.anyTxt, llmConfig, 5, pp).catch((err) => {
+              externalSearchErrors.push(
+                `AnyTXT: ${err instanceof Error ? err.message : String(err)}`,
+              )
+              return []
+            }),
+          )
+        }
+
+        if (externalCalls.length > 0) {
+          const batches = await Promise.all(externalCalls)
+          const seenExternal = new Set<string>()
+          for (const result of batches.flat()) {
+            const key = result.url || `${result.source}:${result.title}:${result.snippet}`
+            if (seenExternal.has(key)) continue
+            seenExternal.add(key)
+            externalSearchResults.push(result)
+            if (externalSearchResults.length >= 10) break
+          }
+        }
 
         // ── Trim index by relevance if over budget ─────────────
         let index = rawIndex
@@ -305,8 +369,7 @@ export function ChatPanel() {
         const pageList = relevantPages.map((p, i) =>
           `[${i + 1}] ${p.title} (${p.path})`
         ).join("\n")
-
-        const outLang = getOutputLanguage(text)
+        const externalContext = formatExternalSearchContext(externalSearchResults)
 
         systemMessages.push({
           role: "system",
@@ -314,10 +377,16 @@ export function ChatPanel() {
             "You are a knowledgeable wiki assistant. Answer questions based on the wiki content provided below.",
             "",
             "## Rules",
-            "- Answer based ONLY on the numbered wiki pages provided below.",
+            externalContext
+              ? "- Answer based ONLY on the numbered wiki pages and external sources provided below."
+              : "- Answer based ONLY on the numbered wiki pages provided below.",
             "- If the provided pages don't contain enough information, say so honestly.",
+            "- Keep subject boundaries strict: do not apply a claim, limitation, evaluation, benchmark result, or recommendation about one entity/model/product/method to another subject just because they share keywords.",
+            "- If pages or external sources discuss multiple subjects, attribute each claim to the exact subject named in that page or source; when uncertain, state the uncertainty instead of generalizing.",
             "- Use [[wikilink]] syntax to reference wiki pages.",
-            "- When citing information, use the page number in brackets, e.g. [1], [2].",
+            externalContext
+              ? "- When citing wiki information, use page numbers like [1], [2]. When citing external information, use external source IDs like [E1], [E2]."
+              : "- When citing information, use the page number in brackets, e.g. [1], [2].",
             "- At the VERY END of your response, add a hidden comment listing which page numbers you used:",
             "  <!-- cited: 1, 3, 5 -->",
             "",
@@ -327,16 +396,14 @@ export function ChatPanel() {
             index ? `## Wiki Index\n${index}` : "",
             relevantPages.length > 0 ? `## Page List\n${pageList}` : "",
             `## Wiki Pages\n\n${pagesContext}`,
+            externalContext ? `## External Sources\n\n${externalContext}` : "",
+            externalSearchErrors.length > 0
+              ? `## External Source Errors\n${externalSearchErrors.map((err) => `- ${err}`).join("\n")}`
+              : "",
             "",
             "---",
             "",
-            `## ⚠️ MANDATORY OUTPUT LANGUAGE: ${outLang}`,
-            "",
-            `You MUST write your entire response in **${outLang}**.`,
-            `The wiki content above may be in a different language, but this is IRRELEVANT to your output language.`,
-            `Ignore the language of the wiki content. Write in ${outLang} only.`,
-            `Even proper nouns should use standard ${outLang} transliteration when appropriate.`,
-            `DO NOT use any other language. This overrides all other instructions.`,
+            buildLanguageDirective(text),
           ].filter(Boolean).join("\n"),
         })
 
@@ -345,7 +412,15 @@ export function ChatPanel() {
         langReminder = buildLanguageReminder(text)
 
         lastQueryPages = relevantPages.map((p) => ({ title: p.title, path: p.path }))
-        queryRefs = [...lastQueryPages]
+        const externalRefs: MessageReference[] = externalSearchResults.map((result) => ({
+          title: result.title,
+          path: result.url,
+          kind: "external",
+          source: result.source,
+          url: result.url,
+          snippet: result.snippet,
+        }))
+        queryRefs = [...lastQueryPages.map((page) => ({ ...page, kind: "wiki" as const })), ...externalRefs]
       }
 
       // ── Conversation history with count limit ────────────────
@@ -368,9 +443,31 @@ export function ChatPanel() {
         const lastIdx = llmMessages.length - 1
         const last = llmMessages[lastIdx]
         if (last && last.role === "user") {
+          // The final user turn may now be either a plain string
+          // (text-only) or a ContentBlock[] (carries images). Prepend
+          // the language reminder to the textual part in both shapes —
+          // string-concat for the legacy form, and into the first text
+          // block (or a new leading text block) for the multimodal form.
+          const prefix = `[${langReminder}]\n\n`
+          let newContent: LLMMessage["content"]
+          if (typeof last.content === "string") {
+            newContent = `${prefix}${last.content}`
+          } else {
+            const blocks = [...last.content]
+            const firstTextIdx = blocks.findIndex((b) => b.type === "text")
+            if (firstTextIdx >= 0) {
+              const tb = blocks[firstTextIdx]
+              if (tb.type === "text") {
+                blocks[firstTextIdx] = { type: "text", text: `${prefix}${tb.text}` }
+              }
+            } else {
+              blocks.unshift({ type: "text", text: prefix })
+            }
+            newContent = blocks
+          }
           llmMessages = [
             ...llmMessages.slice(0, lastIdx),
-            { role: "user", content: `[${langReminder}]\n\n${last.content}` },
+            { role: "user", content: newContent },
           ]
         }
       }
@@ -423,7 +520,7 @@ export function ChatPanel() {
         controller.signal,
       )
     },
-    [llmConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages],
+    [llmConfig, searchApiConfig, addMessage, setStreaming, appendStreamToken, finalizeStream, createConversation, maxHistoryMessages],
   )
 
   const handleStop = useCallback(() => {
@@ -453,7 +550,9 @@ export function ChatPanel() {
         messages: s.messages.filter((m) => m.id !== lastUser.id),
       }))
     }
-    handleSend(lastUserMsg.content)
+    // Re-send with the original text AND images so a regenerated turn
+    // keeps the same vision context.
+    handleSend(lastUserMsg.content, lastUserMsg.images ?? [])
   }, [isStreaming, removeLastAssistantMessage, handleSend])
 
   const handleWriteToWiki = useCallback(async () => {
@@ -484,8 +583,8 @@ export function ChatPanel() {
           <div className="flex flex-1 items-center justify-center text-muted-foreground">
             <div className="text-center">
               <MessageSquare className="mx-auto mb-3 h-8 w-8 opacity-30" />
-              <p className="text-sm">Start a new conversation</p>
-              <p className="mt-1 text-xs opacity-60">Click "New Chat" to begin</p>
+              <p className="text-sm">{t("chat.startNewConversation")}</p>
+              <p className="mt-1 text-xs opacity-60">{t("chat.clickNewChatToBegin")}</p>
             </div>
           </div>
         ) : (
@@ -522,7 +621,7 @@ export function ChatPanel() {
                   className="w-full gap-2"
                 >
                   <BookOpen className="h-4 w-4" />
-                  Write to Wiki
+                  {t("chat.writeToWiki")}
                 </Button>
               </div>
             )}
@@ -533,10 +632,12 @@ export function ChatPanel() {
           onSend={handleSend}
           onStop={handleStop}
           isStreaming={isStreaming}
+          anyTxtAvailable={anyTxtAvailable}
+          imageInputAvailable={imageInputAvailable}
           placeholder={
             mode === "ingest"
-              ? "Discuss the source or ask follow-up questions..."
-              : "Type a message..."
+              ? t("chat.ingestPlaceholder")
+              : t("chat.typeAMessage")
           }
         />
       </div>

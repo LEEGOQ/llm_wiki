@@ -1,53 +1,11 @@
 import { describe, it, expect } from "vitest"
-import { buildAnthropicUrl, parseGoogleLine, getProviderConfig } from "../llm-providers"
+import { buildAnthropicUrl, parseGoogleLine, parseAnthropicLine, getProviderConfig } from "../llm-providers"
 import type { LlmConfig as RealLlmConfig } from "@/stores/wiki-store"
 
-// Inline minimal types to avoid store/zustand dependencies in unit tests
-type Provider = "openai" | "anthropic" | "google" | "ollama" | "custom" | "minimax"
-
-interface LlmConfig {
-  provider: Provider
-  apiKey: string
-  model: string
-  ollamaUrl: string
-  customEndpoint: string
-  maxContextSize: number
-}
-
-// Re-implement the minimax case logic inline so we can unit-test it
-// without a browser environment or Tauri runtime. Keep this in sync with
-// the `case "minimax":` branch in src/lib/llm-providers.ts.
-function buildMiniMaxProviderConfig(config: LlmConfig) {
-  const { apiKey, model, customEndpoint } = config
-  const base = (customEndpoint || "https://api.minimax.io/anthropic").replace(/\/+$/, "")
-  // MiniMax's /anthropic endpoint requires Authorization: Bearer, NOT
-  // x-api-key. Its CORS preflight rejects x-api-key entirely. See the
-  // requiresBearerAuth() helper in src/lib/llm-providers.ts.
-  return {
-    url: `${base}/v1/messages`,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    buildBody: (messages: Array<{ role: string; content: string }>) => {
-      const systemMessages = messages.filter((m) => m.role === "system")
-      const conversationMessages = messages.filter((m) => m.role !== "system")
-      const system = systemMessages.map((m) => m.content).join("\n") || undefined
-      return {
-        messages: conversationMessages,
-        ...(system !== undefined ? { system } : {}),
-        stream: true,
-        max_tokens: 4096,
-        model,
-      }
-    },
-  }
-}
-
-const makeConfig = (overrides: Partial<LlmConfig> = {}): LlmConfig => ({
+const makeConfig = (overrides: Partial<RealLlmConfig> = {}): RealLlmConfig => ({
   provider: "minimax",
   apiKey: "test-key",
-  model: "MiniMax-M2.7",
+  model: "MiniMax-M3",
   ollamaUrl: "http://localhost:11434",
   customEndpoint: "",
   maxContextSize: 204800,
@@ -56,60 +14,66 @@ const makeConfig = (overrides: Partial<LlmConfig> = {}): LlmConfig => ({
 
 describe("MiniMax Provider", () => {
   it("uses the Anthropic Messages endpoint under /anthropic", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     expect(cfg.url).toBe("https://api.minimax.io/anthropic/v1/messages")
   })
 
   it("supports the China regional endpoint via customEndpoint", () => {
-    const cfg = buildMiniMaxProviderConfig(
+    const cfg = getProviderConfig(
       makeConfig({ customEndpoint: "https://api.minimaxi.com/anthropic" }),
     )
     expect(cfg.url).toBe("https://api.minimaxi.com/anthropic/v1/messages")
   })
 
   it("uses Authorization: Bearer (MiniMax rejects x-api-key at CORS layer)", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig({ apiKey: "my-key" }))
+    const cfg = getProviderConfig(makeConfig({ apiKey: "my-key" }))
     expect(cfg.headers.Authorization).toBe("Bearer my-key")
     expect((cfg.headers as Record<string, string>)["x-api-key"]).toBeUndefined()
   })
 
   it("sets Content-Type to application/json", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     expect(cfg.headers["Content-Type"]).toBe("application/json")
   })
 
   it("enables streaming", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     const body = cfg.buildBody([]) as Record<string, unknown>
     expect(body.stream).toBe(true)
   })
 
   it("includes max_tokens (required by Anthropic wire)", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     const body = cfg.buildBody([]) as Record<string, unknown>
     expect(body.max_tokens).toBe(4096)
   })
 
   it("carries the model in the body", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig({ model: "MiniMax-M2.7" }))
+    const cfg = getProviderConfig(makeConfig({ model: "MiniMax-M3" }))
     const body = cfg.buildBody([]) as Record<string, unknown>
-    expect(body.model).toBe("MiniMax-M2.7")
+    expect(body.model).toBe("MiniMax-M3")
   })
 
-  it("separates system messages from conversation (Anthropic convention)", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+  it("separates system messages from conversation and marks the system prompt cacheable", () => {
+    const cfg = getProviderConfig(makeConfig())
     const body = cfg.buildBody([
       { role: "system", content: "You are helpful" },
       { role: "user", content: "Hello" },
     ]) as Record<string, unknown>
-    expect(body.system).toBe("You are helpful")
+    expect(body.system).toEqual([
+      {
+        type: "text",
+        text: "You are helpful",
+        cache_control: { type: "ephemeral" },
+      },
+    ])
     expect(body.messages).toEqual([{ role: "user", content: "Hello" }])
   })
 })
 
 describe("MiniMax provider registration", () => {
   it("minimax is a valid provider value in the type union", () => {
-    const provider: Provider = "minimax"
+    const provider: RealLlmConfig["provider"] = "minimax"
     expect(provider).toBe("minimax")
   })
 })
@@ -164,6 +128,11 @@ describe("parseGoogleLine — Gemini SSE parsing", () => {
     expect(parseGoogleLine(line)).toBe("Hello")
   })
 
+  it("accepts SSE data lines without a space after the colon", () => {
+    const line = 'data:{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}'
+    expect(parseGoogleLine(line)).toBe("Hello")
+  })
+
   it("concatenates text across multiple parts in one event", () => {
     // Gemini 2.5/3.x reasoning models sometimes split output across
     // multiple parts in a single streaming chunk. The old parser only
@@ -194,6 +163,56 @@ describe("parseGoogleLine — Gemini SSE parsing", () => {
   })
 })
 
+describe("parseAnthropicLine — Anthropic SSE parsing", () => {
+  it("extracts text from a standard text_delta event (with space)", () => {
+    const line = 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}'
+    expect(parseAnthropicLine(line)).toBe("Hello")
+  })
+
+  it("extracts text when delta.type is omitted (no-space SSE)", () => {
+    // Some third-party Anthropic-compatible gateways (e.g. Kimi Coding Plan)
+    // emit content_block_delta with a bare `text` field and no `type` inside
+    // delta, and sometimes omit the space after `data:`.
+    const line = 'data:{"type":"content_block_delta","index":0,"delta":{"text":"world"}}'
+    expect(parseAnthropicLine(line)).toBe("world")
+  })
+
+  it("extracts text from a complete message event (single-shot SSE)", () => {
+    const line =
+      'data: {"type":"message","id":"msg_01","role":"assistant","content":[{"type":"text","text":"Hello world"}]}'
+    expect(parseAnthropicLine(line)).toBe("Hello world")
+  })
+
+  it("concatenates all text blocks from a complete message event", () => {
+    const line =
+      'data: {"type":"message","id":"msg_01","role":"assistant","content":[{"type":"text","text":"Hello "},{"type":"tool_use","id":"tool_1"},{"type":"text","text":"world"}]}'
+    expect(parseAnthropicLine(line)).toBe("Hello world")
+  })
+
+  it("falls back to OpenAI-shaped delta.content when present", () => {
+    const line = 'data: {"choices":[{"delta":{"content":"fallback"}}]}'
+    expect(parseAnthropicLine(line)).toBe("fallback")
+  })
+
+  it("returns null for non-content-block-delta events without extractable text", () => {
+    const line = 'data: {"type":"message_start","message":{"id":"msg_01"}}'
+    expect(parseAnthropicLine(line)).toBeNull()
+  })
+
+  it("returns null for non-data lines", () => {
+    expect(parseAnthropicLine("event: start")).toBeNull()
+    expect(parseAnthropicLine("")).toBeNull()
+  })
+})
+
+describe("parseOpenAiLine — OpenAI-compatible SSE parsing", () => {
+  it("accepts SSE data lines without a space after the colon", () => {
+    const cfg = getProviderConfig(makeConfig({ provider: "openai", model: "gpt-4.1" }))
+    const line = 'data:{"choices":[{"delta":{"content":"Hello"}}]}'
+    expect(cfg.parseStream(line)).toBe("Hello")
+  })
+})
+
 describe("Claude Code CLI provider — not reachable via getProviderConfig", () => {
   it("throws, because the subprocess transport dispatches one layer up in streamChat", () => {
     // If this ever stops throwing, someone wired claude-code into the
@@ -204,6 +223,21 @@ describe("Claude Code CLI provider — not reachable via getProviderConfig", () 
         provider: "claude-code",
         apiKey: "",
         model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      } as RealLlmConfig),
+    ).toThrow(/subprocess transport/)
+  })
+})
+
+describe("Codex CLI provider — not reachable via getProviderConfig", () => {
+  it("throws, because the subprocess transport dispatches one layer up in streamChat", () => {
+    expect(() =>
+      getProviderConfig({
+        provider: "codex-cli",
+        apiKey: "",
+        model: "gpt-5.4-mini",
         ollamaUrl: "",
         customEndpoint: "",
         maxContextSize: 200000,
@@ -300,6 +334,77 @@ describe("Sampling override translation across wires", () => {
     expect(body.max_tokens).toBe(500)
   })
 
+  it("OpenAI GPT-5 maps max_tokens and strips unsupported sampling knobs", () => {
+    const cfg = getProviderConfig({
+      provider: "openai",
+      apiKey: "k",
+      model: "gpt-5-nano",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 128000,
+    })
+    const body = cfg.buildBody(baseMessages, {
+      temperature: 0.1,
+      top_p: 0.8,
+      top_k: 40,
+      max_tokens: 4096,
+    }) as Record<string, unknown>
+
+    expect(body.max_completion_tokens).toBe(4096)
+    expect(body.max_tokens).toBeUndefined()
+    expect(body.temperature).toBeUndefined()
+    expect(body.top_p).toBeUndefined()
+    expect(body.top_k).toBeUndefined()
+  })
+
+  it("OpenAI o-series models use max_completion_tokens", () => {
+    const cfg = getProviderConfig({
+      provider: "openai",
+      apiKey: "k",
+      model: "o3-mini",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 128000,
+    })
+    const body = cfg.buildBody(baseMessages, { max_tokens: 8192 }) as Record<string, unknown>
+
+    expect(body.max_completion_tokens).toBe(8192)
+    expect(body.max_tokens).toBeUndefined()
+  })
+
+  it("custom OpenAI-compatible GPT-5 routes keep legacy overrides for OpenRouter-style shims", () => {
+    const cfg = getProviderConfig({
+      provider: "custom",
+      apiKey: "k",
+      model: "gpt-5.5",
+      ollamaUrl: "",
+      customEndpoint: "https://openrouter.ai/api/v1",
+      apiMode: "chat_completions",
+      maxContextSize: 128000,
+    })
+    const body = cfg.buildBody(baseMessages, { temperature: 0.1, max_tokens: 500 }) as Record<string, unknown>
+
+    expect(body.temperature).toBe(0.1)
+    expect(body.max_tokens).toBe(500)
+    expect(body.max_completion_tokens).toBeUndefined()
+  })
+
+  it("custom Kimi routes strip unsupported temperature overrides", () => {
+    const cfg = getProviderConfig({
+      provider: "custom",
+      apiKey: "k",
+      model: "kimi-k2.6",
+      ollamaUrl: "",
+      customEndpoint: "https://api.moonshot.ai/v1",
+      apiMode: "chat_completions",
+      maxContextSize: 256000,
+    })
+    const body = cfg.buildBody(baseMessages, { temperature: 0.1, max_tokens: 4096 }) as Record<string, unknown>
+
+    expect(body.temperature).toBeUndefined()
+    expect(body.max_tokens).toBe(4096)
+  })
+
   it("Anthropic maps stop → stop_sequences and respects max_tokens override", () => {
     const cfg = getProviderConfig({
       provider: "anthropic",
@@ -392,7 +497,7 @@ describe("Origin header — local LLM CORS workaround", () => {
     expect(cfg.headers["Origin"]).toBe("http://localhost")
   })
 
-  it("custom OpenAI-compat endpoint gets the same Origin override (LM Studio / llama.cpp / vLLM)", () => {
+  it("local custom OpenAI-compat endpoint gets the Origin override (LM Studio / llama.cpp / vLLM)", () => {
     // For these servers Origin is ignored entirely — but we send
     // the value anyway so behavior is uniform across local-LLM
     // providers and the rare hardened deployment that does check
@@ -407,6 +512,19 @@ describe("Origin header — local LLM CORS workaround", () => {
       apiMode: "chat_completions",
     } as RealLlmConfig)
     expect(cfg.headers["Origin"]).toBe("http://localhost")
+  })
+
+  it("public custom OpenAI-compat endpoint does not get the local Origin override", () => {
+    const cfg = getProviderConfig({
+      provider: "custom",
+      apiKey: "key",
+      model: "qwen3",
+      ollamaUrl: "",
+      customEndpoint: "https://gateway.example.com/v1",
+      maxContextSize: 8192,
+      apiMode: "chat_completions",
+    } as RealLlmConfig)
+    expect(cfg.headers["Origin"]).toBeUndefined()
   })
 
   it("commercial provider (OpenAI) does NOT get an explicit Origin override", () => {

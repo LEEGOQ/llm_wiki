@@ -1,5 +1,6 @@
 import { writeFile, readFile, createDirectory } from "@/commands/fs"
 import type { ReviewItem } from "@/stores/review-store"
+import type { LintItem } from "@/stores/lint-store"
 import type { DisplayMessage, Conversation } from "@/stores/chat-store"
 import { normalizePath } from "@/lib/path-utils"
 
@@ -24,9 +25,31 @@ export async function loadReviewItems(projectPath: string): Promise<ReviewItem[]
   }
 }
 
+export async function saveLintItems(projectPath: string, items: LintItem[]): Promise<void> {
+  const pp = normalizePath(projectPath)
+  await ensureDir(pp)
+  await writeFile(`${pp}/.llm-wiki/lint.json`, JSON.stringify(items, null, 2))
+}
+
+export async function loadLintItems(projectPath: string): Promise<LintItem[]> {
+  const pp = normalizePath(projectPath)
+  try {
+    const content = await readFile(`${pp}/.llm-wiki/lint.json`)
+    return JSON.parse(content) as LintItem[]
+  } catch {
+    return []
+  }
+}
+
 interface PersistedChatData {
   conversations: Conversation[]
   messages: DisplayMessage[]
+}
+
+function stripPersistedMessageImages(msg: DisplayMessage): DisplayMessage {
+  if (!msg.images || msg.images.length === 0) return msg
+  const { images: _images, ...rest } = msg
+  return rest
 }
 
 export async function saveChatHistory(
@@ -47,7 +70,10 @@ export async function saveChatHistory(
   const byConversation = new Map<string, DisplayMessage[]>()
   for (const msg of messages) {
     const list = byConversation.get(msg.conversationId) ?? []
-    list.push(msg)
+    // Images can be multi-megabyte base64 payloads. Keep them in memory for the
+    // current chat turn, but don't persist them into chat JSON where they would
+    // quickly bloat auto-save files and project backups.
+    list.push(stripPersistedMessageImages(msg))
     byConversation.set(msg.conversationId, list)
   }
 

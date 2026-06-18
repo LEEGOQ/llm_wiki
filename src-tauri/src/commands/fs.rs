@@ -1,25 +1,60 @@
 use std::fs;
 use std::io::Read as IoRead;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
-use calamine::{Reader, open_workbook_auto, Data};
+use calamine::{open_workbook_auto, Data, Reader};
+use office_oxide::Document;
 
+use crate::commands::file_sync;
 use crate::panic_guard::run_guarded;
 use crate::types::wiki::FileNode;
 
 /// Known binary formats that need special extraction
-const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "odt", "ods", "odp"];
+const OFFICE_EXTS: &[&str] = &["doc", "docx", "pptx", "xls", "xlsx", "odt", "ods", "odp"];
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
 const MEDIA_EXTS: &[&str] = &[
-    "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v",
-    "mp3", "wav", "ogg", "flac", "aac", "m4a", "wma",
+    "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v", "mp3", "wav", "ogg", "flac", "aac",
+    "m4a", "wma",
 ];
-const LEGACY_DOC_EXTS: &[&str] = &["doc", "xls", "ppt", "pages", "numbers", "key", "epub"];
+const LEGACY_DOC_EXTS: &[&str] = &["ppt", "pages", "numbers", "key", "epub"];
+
+fn require_absolute_path(operation: &str, path: &str) -> Result<(), String> {
+    if is_absolute_path_cross_platform(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{operation} requires an absolute path; got relative path '{}'",
+            path
+        ))
+    }
+}
+
+fn is_absolute_path_cross_platform(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if Path::new(path).is_absolute() {
+        return true;
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+
+    path.starts_with(r"\\") || path.starts_with("//")
+}
 
 #[tauri::command]
-pub async fn read_file(path: String) -> Result<String, String> {
+pub async fn read_file(path: String, extract_images: Option<bool>) -> Result<String, String> {
     // `spawn_blocking` is REQUIRED, not a perf nicety. The body does
     // synchronous PDF/Office text extraction (pdfium FFI, calamine,
     // zip + image decode) that can take 10s+ on big files. Running
@@ -42,8 +77,10 @@ pub async fn read_file(path: String) -> Result<String, String> {
                 return Ok(cached);
             }
 
+            let include_images = extract_images.unwrap_or(true);
+
             match ext.as_str() {
-                "pdf" => extract_pdf_text(&path),
+                "pdf" => extract_pdf_text(&path, include_images),
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
                 e if IMAGE_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -94,7 +131,7 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
                 .to_lowercase();
 
             let text = match ext.as_str() {
-                "pdf" => extract_pdf_text(&path)?,
+                "pdf" => extract_pdf_text(&path, false)?,
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
                 _ => return Ok("no preprocessing needed".to_string()),
             };
@@ -110,10 +147,7 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
 fn cache_path_for(original: &Path) -> std::path::PathBuf {
     let parent = original.parent().unwrap_or(Path::new("."));
     let cache_dir = parent.join(".cache");
-    let file_name = original
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let file_name = original.file_name().unwrap_or_default().to_string_lossy();
     cache_dir.join(format!("{}.txt", file_name))
 }
 
@@ -133,8 +167,8 @@ fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(&cache_path, text)
-        .map_err(|e| format!("Failed to write cache: {}", e))
+    crate::commands::file_sync::mark_app_write_path(&cache_path);
+    fs::write(&cache_path, text).map_err(|e| format!("Failed to write cache: {}", e))
 }
 
 /// Global PDFium instance — the library prefers a single binding shared
@@ -173,8 +207,7 @@ pub(crate) fn lock_pdfium() -> std::sync::MutexGuard<'static, ()> {
 /// once the AppHandle is available. Lets the pdfium resolver find the
 /// bundled dylib without re-implementing Tauri's platform-specific
 /// resource-dir logic.
-static RESOURCE_DIR_HINT: std::sync::OnceLock<std::path::PathBuf> =
-    std::sync::OnceLock::new();
+static RESOURCE_DIR_HINT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 /// Called from Tauri's setup() with the resolved resource directory.
 /// No-op if already set.
@@ -262,7 +295,10 @@ fn pdfium_candidate_paths() -> Vec<String> {
                 push(&mut v, exe_dir.join("pdfium").join("pdfium.dll"));
                 push(&mut v, exe_dir.join("libpdfium.dll"));
                 push(&mut v, exe_dir.join("resources").join("pdfium.dll"));
-                push(&mut v, exe_dir.join("resources").join("pdfium").join("pdfium.dll"));
+                push(
+                    &mut v,
+                    exe_dir.join("resources").join("pdfium").join("pdfium.dll"),
+                );
             }
 
             #[cfg(target_os = "linux")]
@@ -270,7 +306,13 @@ fn pdfium_candidate_paths() -> Vec<String> {
                 push(&mut v, exe_dir.join("libpdfium.so"));
                 push(&mut v, exe_dir.join("pdfium").join("libpdfium.so"));
                 push(&mut v, exe_dir.join("resources").join("libpdfium.so"));
-                push(&mut v, exe_dir.join("resources").join("pdfium").join("libpdfium.so"));
+                push(
+                    &mut v,
+                    exe_dir
+                        .join("resources")
+                        .join("pdfium")
+                        .join("libpdfium.so"),
+                );
                 push(&mut v, exe_dir.join("../lib/libpdfium.so"));
             }
         }
@@ -308,69 +350,51 @@ pub(crate) fn pdfium() -> Result<&'static pdfium_render::prelude::Pdfium, String
         .map_err(|e| e.clone())
 }
 
-/// Extract a PDF as markdown — text + per-page image references
-/// when the file lives under a project's `raw/sources/` (the
-/// layout the import pipeline produces). Falls back to text-only
-/// when the PDF is opened from anywhere else.
-///
-/// Layout heuristic: a PDF at `<project>/raw/sources/<name>.pdf`
-/// implies project root = `<project>` and image dest =
-/// `<project>/wiki/media/<name>/`. We use absolute filesystem paths
-/// in the emitted `![](url)` references so the markdown previews
-/// (raw-source view AND wiki-summary view) both render via
-/// `convertFileSrc` without anyone having to know which directory
-/// they're rendering from.
+/// Extract a PDF as markdown. When `include_images` is true and the PDF
+/// is opened directly from `<project>/raw/sources`, this also writes
+/// preview images to `<project>/wiki/media/<file-stem>/` and emits image
+/// markdown. Ingest passes `include_images=false` and owns image
+/// extraction through the canonical source-identity slug, preventing a
+/// duplicate `<file-stem>` media folder for nested sources.
 ///
 /// Lock: delegates to `extract_pdf_markdown`, which acquires the
 /// pdfium lock internally. We must NOT take it here too —
 /// `std::sync::Mutex` is non-reentrant.
-fn extract_pdf_text(path: &str) -> Result<String, String> {
+fn extract_pdf_text(path: &str, include_images: bool) -> Result<String, String> {
     use crate::commands::extract_images::{extract_pdf_markdown, ExtractOptions};
 
-    let p = Path::new(path);
-    let parent = p.parent();
-    let stem = p
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    if include_images {
+        let p = Path::new(path);
+        let parent = p.parent();
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
 
-    // The path-component check uses `ends_with` on `Path` which
-    // matches the LAST component (not a string-suffix check), so
-    // `/foo/raw/sources/bar.pdf` correctly identifies as under
-    // `raw/sources/` while `/foo/braw/source-thing/bar.pdf` does
-    // not.
-    let parent_is_sources = parent.map(|d| d.ends_with("sources")).unwrap_or(false);
-    let raw_dir = parent.and_then(|d| d.parent());
-    let raw_is_raw = raw_dir.map(|d| d.ends_with("raw")).unwrap_or(false);
-    let project_root = if parent_is_sources && raw_is_raw {
-        raw_dir.and_then(|d| d.parent())
-    } else {
-        None
-    };
+        let parent_is_sources = parent.map(|d| d.ends_with("sources")).unwrap_or(false);
+        let raw_dir = parent.and_then(|d| d.parent());
+        let raw_is_raw = raw_dir.map(|d| d.ends_with("raw")).unwrap_or(false);
+        let project_root = if parent_is_sources && raw_is_raw {
+            raw_dir.and_then(|d| d.parent())
+        } else {
+            None
+        };
 
-    if let Some(root) = project_root {
-        if !stem.is_empty() {
-            let media_dir = root.join("wiki").join("media").join(&stem);
-            // Forward-slash absolute path so we don't ship `\` into
-            // markdown that the JS-side resolver would then have to
-            // re-normalize. The resolver does handle backslashes,
-            // but emitting clean URLs in the first place avoids
-            // surprises in cache files we save to disk.
-            let url_prefix = media_dir.to_string_lossy().replace('\\', "/");
-            return extract_pdf_markdown(
-                path,
-                Some(&media_dir),
-                &url_prefix,
-                &ExtractOptions::default(),
-            );
+        if let Some(root) = project_root {
+            if !stem.is_empty() {
+                let media_dir = root.join("wiki").join("media").join(&stem);
+                let url_prefix = media_dir.to_string_lossy().replace('\\', "/");
+                return extract_pdf_markdown(
+                    path,
+                    Some(&media_dir),
+                    &url_prefix,
+                    &ExtractOptions::default(),
+                );
+            }
         }
     }
 
-    // PDFs not under <project>/raw/sources/ — text-only fallback.
-    // Skip the image side of the extraction entirely (no media
-    // destination → extract_pdf_markdown only writes text + page
-    // headers, no pdfium image-object enumeration).
     extract_pdf_markdown(path, None, "", &ExtractOptions::default())
 }
 
@@ -386,9 +410,13 @@ fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
         return extract_docx_with_library(path);
     }
 
+    // DOC: use office_oxide for legacy Word binary documents.
+    if ext == "doc" {
+        return extract_doc_with_office_oxide(path);
+    }
+
     // PPTX and ODF: use ZIP-based parsing
-    let file = fs::File::open(path)
-        .map_err(|e| format!("Failed to open '{}': {}", path, e))?;
+    let file = fs::File::open(path).map_err(|e| format!("Failed to open '{}': {}", path, e))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| format!("Failed to read ZIP archive '{}': {}", path, e))?;
 
@@ -396,6 +424,23 @@ fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
         "pptx" => extract_pptx_markdown(&mut archive),
         "odt" | "odp" => extract_odf_text(&mut archive),
         _ => Ok("[Unsupported format]".to_string()),
+    }
+}
+
+/// Extract legacy Word `.doc` text using office_oxide.
+fn extract_doc_with_office_oxide(path: &str) -> Result<String, String> {
+    let doc = Document::open(path).map_err(|e| format!("Failed to parse DOC '{}': {}", path, e))?;
+    let markdown = doc.to_markdown();
+    let text = if markdown.trim().is_empty() {
+        doc.plain_text()
+    } else {
+        markdown
+    };
+
+    if text.trim().is_empty() {
+        Ok("[Document: no extractable text found in .doc file]".to_string())
+    } else {
+        Ok(text)
     }
 }
 
@@ -456,7 +501,9 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
                 }
 
                 let text = para_text.trim().to_string();
-                if text.is_empty() { continue; }
+                if text.is_empty() {
+                    continue;
+                }
 
                 if is_heading {
                     let prefix = "#".repeat(heading_level as usize);
@@ -505,7 +552,9 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
                         result.push_str(" |\n");
                         if i == 0 {
                             result.push('|');
-                            for _ in 0..max_cols { result.push_str(" --- |"); }
+                            for _ in 0..max_cols {
+                                result.push_str(" --- |");
+                            }
                             result.push('\n');
                         }
                     }
@@ -573,7 +622,9 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
             let tag_start = i;
             i += 1;
             let is_closing = i < len && chars[i] == '/';
-            if is_closing { i += 1; }
+            if is_closing {
+                i += 1;
+            }
 
             let mut tag_name = String::new();
             while i < len && chars[i] != '>' && chars[i] != ' ' && chars[i] != '/' {
@@ -587,7 +638,9 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
                 tag_content.push(chars[i]);
                 i += 1;
             }
-            if i < len { i += 1; } // skip >
+            if i < len {
+                i += 1;
+            } // skip >
 
             match tag_name.as_str() {
                 // Paragraph start
@@ -630,16 +683,26 @@ fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
                             }
                         }
                     }
-                    if tag_content.contains("ListParagraph") || tag_content.contains("listParagraph") {
+                    if tag_content.contains("ListParagraph")
+                        || tag_content.contains("listParagraph")
+                    {
                         in_list_item = true;
                     }
                 }
                 // Bold
-                "w:b" if !is_closing && !tag_content.contains("w:val=\"0\"") && !tag_content.contains("w:val=\"false\"") => {
+                "w:b"
+                    if !is_closing
+                        && !tag_content.contains("w:val=\"0\"")
+                        && !tag_content.contains("w:val=\"false\"") =>
+                {
                     is_bold = true;
                 }
                 // Italic
-                "w:i" if !is_closing && !tag_content.contains("w:val=\"0\"") && !tag_content.contains("w:val=\"false\"") => {
+                "w:i"
+                    if !is_closing
+                        && !tag_content.contains("w:val=\"0\"")
+                        && !tag_content.contains("w:val=\"false\"") =>
+                {
                     is_italic = true;
                 }
                 // Run end — apply formatting
@@ -728,8 +791,16 @@ fn extract_pptx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
 
     // Sort by slide number
     slide_names.sort_by(|a, b| {
-        let num_a = a.trim_start_matches("ppt/slides/slide").trim_end_matches(".xml").parse::<u32>().unwrap_or(0);
-        let num_b = b.trim_start_matches("ppt/slides/slide").trim_end_matches(".xml").parse::<u32>().unwrap_or(0);
+        let num_a = a
+            .trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<u32>()
+            .unwrap_or(0);
+        let num_b = b
+            .trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<u32>()
+            .unwrap_or(0);
         num_a.cmp(&num_b)
     });
 
@@ -782,12 +853,6 @@ fn extract_pptx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
     }
 }
 
-/// Extract XLSX/XLS/ODS to Markdown tables using calamine.
-fn extract_xlsx_markdown(_archive: &mut zip::ZipArchive<fs::File>) -> Result<String, String> {
-    // calamine needs the file path, not the archive
-    Err("Use extract_spreadsheet instead".to_string())
-}
-
 /// Extract spreadsheet to Markdown using calamine (supports xlsx, xls, ods).
 fn extract_spreadsheet(path: &str) -> Result<String, String> {
     let mut workbook = open_workbook_auto(path)
@@ -798,7 +863,9 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
 
     for sheet_name in &sheet_names {
         if let Ok(range) = workbook.worksheet_range(sheet_name) {
-            if range.is_empty() { continue; }
+            if range.is_empty() {
+                continue;
+            }
 
             if sheet_names.len() > 1 {
                 result.push_str(&format!("## {}\n\n", sheet_name));
@@ -808,8 +875,9 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
             let mut max_cols = 0;
 
             for row in range.rows() {
-                let cells: Vec<String> = row.iter().map(|cell| {
-                    match cell {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|cell| match cell {
                         Data::Empty => String::new(),
                         Data::String(s) => s.clone(),
                         Data::Float(f) => {
@@ -825,14 +893,18 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
                         Data::DateTimeIso(s) => s.clone(),
                         Data::DurationIso(s) => s.clone(),
                         Data::Error(e) => format!("ERR:{:?}", e),
-                    }
-                }).collect();
-                if cells.len() > max_cols { max_cols = cells.len(); }
+                    })
+                    .collect();
+                if cells.len() > max_cols {
+                    max_cols = cells.len();
+                }
                 rows.push(cells);
             }
 
             // Skip empty sheets
-            if rows.is_empty() || max_cols == 0 { continue; }
+            if rows.is_empty() || max_cols == 0 {
+                continue;
+            }
 
             for (i, row) in rows.iter().enumerate() {
                 let mut padded = row.clone();
@@ -845,7 +917,9 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
 
                 if i == 0 {
                     result.push('|');
-                    for _ in 0..max_cols { result.push_str(" --- |"); }
+                    for _ in 0..max_cols {
+                        result.push_str(" --- |");
+                    }
                     result.push('\n');
                 }
             }
@@ -862,8 +936,8 @@ fn extract_spreadsheet(path: &str) -> Result<String, String> {
 
 /// Extract OpenDocument format text (basic).
 fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, String> {
-    let xml = read_zip_file(archive, "content.xml")
-        .ok_or_else(|| "No content.xml found".to_string())?;
+    let xml =
+        read_zip_file(archive, "content.xml").ok_or_else(|| "No content.xml found".to_string())?;
 
     let mut result = String::new();
     let mut in_tag = false;
@@ -881,7 +955,11 @@ fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, S
     }
 
     let cleaned = decode_xml_entities(&result);
-    let lines: Vec<&str> = cleaned.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = cleaned
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
 
     if lines.is_empty() {
         Ok("[Could not extract text from this file]".to_string())
@@ -894,17 +972,92 @@ fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, S
 pub async fn write_file(path: String, contents: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("write_file", || {
+            require_absolute_path("write_file", &path)?;
             let p = Path::new(&path);
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
             }
+            file_sync::mark_app_write_path(p);
             fs::write(&path, contents)
-                .map_err(|e| format!("Failed to write file '{}': {}", path, e))
+                .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
+            file_sync::mark_app_write_path(p);
+            Ok(())
         })
     })
     .await
     .map_err(|e| format!("write_file blocking task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn write_file_base64(path: String, base64: String) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("write_file_base64", || {
+            require_absolute_path("write_file_base64", &path)?;
+            let bytes = B64
+                .decode(base64.as_bytes())
+                .map_err(|e| format!("Invalid base64 for '{}': {}", path, e))?;
+            let p = Path::new(&path);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
+            }
+            file_sync::mark_app_write_path(p);
+            fs::write(&path, bytes)
+                .map_err(|e| format!("Failed to write binary file '{}': {}", path, e))?;
+            file_sync::mark_app_write_path(p);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("write_file_base64 blocking task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn write_file_atomic(path: String, contents: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("write_file_atomic", || {
+            require_absolute_path("write_file_atomic", &path)?;
+            let p = Path::new(&path);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
+            }
+
+            let file_name = p
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "llm-wiki-file".to_string());
+            let tmp_path = p.with_file_name(format!(
+                ".{file_name}.{}.tmp",
+                chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+            ));
+
+            file_sync::mark_app_write_path(&tmp_path);
+            file_sync::mark_app_write_path(p);
+            fs::write(&tmp_path, contents).map_err(|e| {
+                format!("Failed to write temp file '{}': {}", tmp_path.display(), e)
+            })?;
+
+            fs::rename(&tmp_path, p).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                format!(
+                    "Failed to move temp file '{}' to '{}': {}",
+                    tmp_path.display(),
+                    path,
+                    e
+                )
+            })?;
+            file_sync::mark_app_write_path(p);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("write_file_atomic blocking task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -958,11 +1111,7 @@ fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode
     let mut nodes = Vec::new();
     for entry in entries {
         let entry_path = entry.path();
-        let name = entry
-            .file_name()
-            .to_str()
-            .unwrap_or("")
-            .to_string();
+        let name = entry.file_name().to_str().unwrap_or("").to_string();
         // Always return forward-slash paths so the TS layer can compare
         // and compose paths consistently across Windows and Unix. Windows
         // APIs accept forward slashes, so normalizing here is safe and
@@ -1002,8 +1151,10 @@ pub async fn copy_file(source: String, destination: String) -> Result<(), String
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dirs: {}", e))?;
             }
+            file_sync::mark_app_write_path(dest);
             fs::copy(&source, &destination)
                 .map_err(|e| format!("Failed to copy '{}' to '{}': {}", source, destination, e))?;
+            file_sync::mark_app_write_path(dest);
             Ok(())
         })
     })
@@ -1019,6 +1170,7 @@ pub async fn copy_directory(source: String, destination: String) -> Result<Vec<S
         run_guarded("copy_directory", || {
             let src = Path::new(&source);
             let dest = Path::new(&destination);
+            file_sync::mark_app_write_path(dest);
 
             if !src.is_dir() {
                 return Err(format!("'{}' is not a directory", source));
@@ -1050,9 +1202,9 @@ pub async fn copy_directory(source: String, destination: String) -> Result<Vec<S
                     if path.is_dir() {
                         copy_recursive(&path, &dest_path, files)?;
                     } else {
-                        fs::copy(&path, &dest_path).map_err(|e| {
-                            format!("Failed to copy '{}': {}", path.display(), e)
-                        })?;
+                        fs::copy(&path, &dest_path)
+                            .map_err(|e| format!("Failed to copy '{}': {}", path.display(), e))?;
+                        file_sync::mark_app_write_path(&dest_path);
                         files.push(dest_path.to_string_lossy().replace('\\', "/"));
                     }
                 }
@@ -1072,23 +1224,62 @@ pub async fn delete_file(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("delete_file", || {
             let p = Path::new(&path);
+            file_sync::mark_app_write_path(p);
             if p.is_dir() {
-                fs::remove_dir_all(&path)
-                    .map_err(|e| format!("Failed to delete directory '{}': {}", path, e))
+                remove_path_with_retry(&path, true)
+                    .map_err(|e| format!("Failed to delete directory '{}': {}", path, e))?;
             } else {
-                fs::remove_file(&path)
-                    .map_err(|e| format!("Failed to delete file '{}': {}", path, e))
+                remove_path_with_retry(&path, false)
+                    .map_err(|e| format!("Failed to delete file '{}': {}", path, e))?;
             }
+            file_sync::mark_app_write_path(p);
+            Ok(())
         })
     })
     .await
     .map_err(|e| format!("delete_file blocking task join error: {e}"))?
 }
 
+fn remove_path_with_retry(path: &str, is_dir: bool) -> Result<(), std::io::Error> {
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..4 {
+        let result = if is_dir {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < 3 && is_windows_transient_delete_error(&err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(250 * (1_u64 << attempt)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("delete failed")))
+}
+
+fn is_windows_transient_delete_error(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(err.raw_os_error(), Some(32 | 33))
+            || err.kind() == std::io::ErrorKind::PermissionDenied
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = err;
+        false
+    }
+}
+
 /// Find wiki pages that reference a given source file name.
 /// Scans all .md files under wiki/ for the source filename in frontmatter or content.
 #[tauri::command]
-pub async fn find_related_wiki_pages(project_path: String, source_name: String) -> Result<Vec<String>, String> {
+pub async fn find_related_wiki_pages(
+    project_path: String,
+    source_name: String,
+) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("find_related_wiki_pages", || {
             let wiki_dir = Path::new(&project_path).join("wiki");
@@ -1105,7 +1296,11 @@ pub async fn find_related_wiki_pages(project_path: String, source_name: String) 
     .map_err(|e| format!("find_related_wiki_pages blocking task join error: {e}"))?
 }
 
-fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String>) -> Result<(), String> {
+fn collect_related_pages(
+    dir: &Path,
+    source_name: &str,
+    results: &mut Vec<String>,
+) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
 
     // Get just the filename without path — use Path for cross-platform separator handling
@@ -1125,7 +1320,11 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
         .rev()
         .collect::<Vec<_>>()
         .join(".");
-    let file_stem_lower = if file_stem.is_empty() { file_name_lower.clone() } else { file_stem.to_lowercase() };
+    let file_stem_lower = if file_stem.is_empty() {
+        file_name_lower.clone()
+    } else {
+        file_stem.to_lowercase()
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1148,11 +1347,9 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
 
                 // Match 2: source summary page (wiki/sources/{stem}.md)
                 // Use Path component iteration to avoid hardcoded separator assumptions
-                let is_in_sources_dir = path
-                    .components()
-                    .any(|c| c.as_os_str() == "sources");
-                let is_source_summary = is_in_sources_dir
-                    && fname.to_lowercase().starts_with(&file_stem_lower);
+                let is_in_sources_dir = path.components().any(|c| c.as_os_str() == "sources");
+                let is_source_summary =
+                    is_in_sources_dir && fname.to_lowercase().starts_with(&file_stem_lower);
 
                 // Match 3: the page's *sources block* mentions the
                 // filename. Covers the multi-line YAML list form
@@ -1191,7 +1388,10 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
                                 // indented; an un-indented line means
                                 // we've left the sources block for
                                 // another top-level field.
-                                if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+                                if line.is_empty()
+                                    || line.starts_with(' ')
+                                    || line.starts_with('\t')
+                                {
                                     if line.contains(&file_name_lower) {
                                         found = true;
                                         break;
@@ -1224,6 +1424,7 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
 pub async fn create_directory(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("create_directory", || {
+            require_absolute_path("create_directory", &path)?;
             fs::create_dir_all(&path)
                 .map_err(|e| format!("Failed to create directory '{}': {}", path, e))
         })
@@ -1256,8 +1457,7 @@ pub async fn read_file_as_base64(path: String) -> Result<FileBase64, String> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("read_file_as_base64", || {
-            let bytes = fs::read(&path)
-                .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+            let bytes = fs::read(&path).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
             let p = Path::new(&path);
             let ext = p
                 .extension()
@@ -1299,6 +1499,67 @@ pub async fn file_exists(path: String) -> Result<bool, String> {
     })
     .await
     .map_err(|e| format!("file_exists blocking task join error: {e}"))?
+}
+
+/// Get the last modified timestamp of a file in milliseconds since Unix epoch.
+/// Returns 0 if the file doesn't exist or metadata can't be read.
+#[tauri::command]
+pub async fn get_file_modified_time(path: String) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("get_file_modified_time", || {
+            let metadata = fs::metadata(&path)
+                .map_err(|e| format!("Failed to get metadata for '{}': {}", path, e))?;
+            let modified = metadata
+                .modified()
+                .map_err(|e| format!("Failed to get modified time for '{}': {}", path, e))?;
+            let duration = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("Time error for '{}': {}", path, e))?;
+            Ok(duration.as_millis() as u64)
+        })
+    })
+    .await
+    .map_err(|e| format!("get_file_modified_time blocking task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn get_file_size(path: String) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("get_file_size", || {
+            let metadata = fs::metadata(&path)
+                .map_err(|e| format!("Failed to get metadata for '{}': {}", path, e))?;
+            Ok(metadata.len())
+        })
+    })
+    .await
+    .map_err(|e| format!("get_file_size blocking task join error: {e}"))?
+}
+
+/// Compute MD5 hash of a file. Returns the hex-encoded hash string.
+#[tauri::command]
+pub async fn get_file_md5(path: String) -> Result<String, String> {
+    use md5::{Digest, Md5};
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("get_file_md5", || {
+            let mut file = fs::File::open(&path)
+                .map_err(|e| format!("Failed to open file '{}': {}", path, e))?;
+            let mut hasher = Md5::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let result = hasher.finalize();
+            Ok(format!("{:x}", result))
+        })
+    })
+    .await
+    .map_err(|e| format!("get_file_md5 blocking task join error: {e}"))?
 }
 
 #[cfg(test)]
@@ -1351,9 +1612,12 @@ mod tests {
 
         for (name, bytes) in payloads {
             let path = tmp_pdf_with_bytes(bytes);
-            let result = read_file(path.clone()).await;
+            let result = read_file(path.clone(), None).await;
             let _ = fs::remove_file(&path);
-            eprintln!("[{name}] => {:?}", result.as_ref().map(|s| &s[..s.len().min(80)]));
+            eprintln!(
+                "[{name}] => {:?}",
+                result.as_ref().map(|s| &s[..s.len().min(80)])
+            );
         }
     }
 
@@ -1363,8 +1627,58 @@ mod tests {
     /// through read_file's guarded path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_file_returns_err_on_missing_file_instead_of_panicking() {
-        let result = read_file("/nonexistent/path/that/does/not/exist.pdf".to_string()).await;
+        let result = read_file(
+            "/nonexistent/path/that/does/not/exist.pdf".to_string(),
+            None,
+        )
+        .await;
         assert!(result.is_err() || result.is_ok()); // must at least return
+    }
+
+    #[test]
+    fn extract_doc_with_office_oxide_handles_missing_file() {
+        let result = extract_doc_with_office_oxide("/nonexistent/path/that/does/not/exist.doc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse DOC"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_file_base64_writes_decoded_binary_bytes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "llm-wiki-base64-{}.bin",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        write_file_base64(path_str.clone(), "AAECA/8=".to_string())
+            .await
+            .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(bytes, vec![0, 1, 2, 3, 255]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_file_base64_rejects_invalid_base64_and_relative_paths() {
+        let invalid = write_file_base64(
+            std::env::temp_dir()
+                .join("llm-wiki-invalid-base64.bin")
+                .to_string_lossy()
+                .to_string(),
+            "not!!base64".to_string(),
+        )
+        .await;
+        assert!(invalid.is_err());
+        assert!(invalid.unwrap_err().contains("Invalid base64"));
+
+        let relative = write_file_base64("relative.bin".to_string(), "AA==".to_string()).await;
+        assert!(relative.is_err());
+        assert!(relative.unwrap_err().contains("requires an absolute path"));
     }
 
     /// Ad-hoc probe: run the production PDF extraction path against every
@@ -1393,7 +1707,8 @@ mod tests {
                     let p = entry.path();
                     if p.is_dir() {
                         walk(&p, out);
-                    } else if p.extension()
+                    } else if p
+                        .extension()
                         .and_then(|e| e.to_str())
                         .map(|e| e.eq_ignore_ascii_case("pdf"))
                         .unwrap_or(false)
@@ -1406,7 +1721,11 @@ mod tests {
         walk(root, &mut pdfs);
         pdfs.sort();
 
-        eprintln!("\n[pdf_probe] found {} PDFs under {}\n", pdfs.len(), root.display());
+        eprintln!(
+            "\n[pdf_probe] found {} PDFs under {}\n",
+            pdfs.len(),
+            root.display()
+        );
 
         let mut ok = 0usize;
         let mut err = 0usize;
@@ -1417,15 +1736,27 @@ mod tests {
             // Call extract_pdf_text directly (not read_file) so we bypass
             // the .cache sibling dir and always exercise the parser.
             let path_str = path.to_string_lossy().to_string();
-            let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str));
+            let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str, true));
             match result {
                 Ok(Ok(text)) => {
                     ok += 1;
-                    eprintln!("[{:>3}/{}] OK     ({:>7} chars)  {}", idx + 1, pdfs.len(), text.len(), display);
+                    eprintln!(
+                        "[{:>3}/{}] OK     ({:>7} chars)  {}",
+                        idx + 1,
+                        pdfs.len(),
+                        text.len(),
+                        display
+                    );
                 }
                 Ok(Err(e)) => {
                     err += 1;
-                    eprintln!("[{:>3}/{}] ERR    {}  →  {}", idx + 1, pdfs.len(), display, e);
+                    eprintln!(
+                        "[{:>3}/{}] ERR    {}  →  {}",
+                        idx + 1,
+                        pdfs.len(),
+                        display,
+                        e
+                    );
                 }
                 Err(payload) => {
                     panicked += 1;
@@ -1436,12 +1767,24 @@ mod tests {
                     } else {
                         "(non-string panic)".to_string()
                     };
-                    eprintln!("[{:>3}/{}] PANIC  {}  →  {}", idx + 1, pdfs.len(), display, msg);
+                    eprintln!(
+                        "[{:>3}/{}] PANIC  {}  →  {}",
+                        idx + 1,
+                        pdfs.len(),
+                        display,
+                        msg
+                    );
                 }
             }
         }
 
-        eprintln!("\n[pdf_probe] summary: {} OK / {} ERR / {} PANIC (total {})", ok, err, panicked, pdfs.len());
+        eprintln!(
+            "\n[pdf_probe] summary: {} OK / {} ERR / {} PANIC (total {})",
+            ok,
+            err,
+            panicked,
+            pdfs.len()
+        );
     }
 
     // ── collect_related_pages: regression coverage for the three match ─────
@@ -1471,7 +1814,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         for (rel, body) in files {
             let p = dir.join(rel);
-            if let Some(parent) = p.parent() { fs::create_dir_all(parent).unwrap(); }
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
             fs::write(&p, body).unwrap();
         }
         dir
@@ -1528,10 +1873,7 @@ mod tests {
         // deleted source's stem counts as the source-summary page —
         // kept linked even if its sources field happens to be missing.
         let wiki = make_wiki(&[
-            (
-                "sources/test.md",
-                "---\ntitle: Test Summary\n---\nbody\n",
-            ),
+            ("sources/test.md", "---\ntitle: Test Summary\n---\nbody\n"),
             (
                 "concepts/unrelated.md",
                 "---\ntitle: Unrelated\nsources: [\"other.md\"]\n---\nbody\n",
@@ -1678,6 +2020,24 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn reject_relative_write_paths_before_touching_cwd() {
+        assert!(require_absolute_path("write_file", "wiki/sources/stray.md").is_err());
+        assert!(require_absolute_path("write_file", "./wiki/sources/stray.md").is_err());
+    }
+
+    #[test]
+    fn allow_absolute_write_paths() {
+        assert!(require_absolute_path("write_file", "/tmp/project/wiki/sources/page.md").is_ok());
+        assert!(require_absolute_path("write_file", "C:/project/wiki/sources/page.md").is_ok());
+        assert!(require_absolute_path("write_file", r"C:\project\wiki\sources\page.md").is_ok());
+        assert!(
+            require_absolute_path("write_file", r"\\server\share\wiki\sources\page.md").is_ok()
+        );
+        assert!(require_absolute_path("write_file", "//server/share/wiki/sources/page.md").is_ok());
+        assert!(require_absolute_path("write_file", "C:wiki/sources/page.md").is_err());
+    }
+
     /// Pull the inner sync `copy_recursive` body out from
     /// `copy_directory` so the test doesn't need to spin up a
     /// tokio runtime just to exercise file-system recursion.
@@ -1722,7 +2082,11 @@ mod tests {
         assert_eq!(copied.len(), 2, "expected two files, got: {:?}", copied);
         // Deep file made it across with full nesting preserved.
         let leaf_dest = dest.join("a/b/c/d/e/leaf.txt");
-        assert!(leaf_dest.exists(), "deep leaf.txt missing at {:?}", leaf_dest);
+        assert!(
+            leaf_dest.exists(),
+            "deep leaf.txt missing at {:?}",
+            leaf_dest
+        );
         assert_eq!(std::fs::read(&leaf_dest).unwrap(), b"deep content");
         // Top-level file too.
         assert!(dest.join("top.md").exists());
@@ -1791,7 +2155,13 @@ mod tests {
         // forward-slashed and end with the expected filename).
         let names: Vec<String> = copied
             .iter()
-            .map(|p| Path::new(p).file_name().unwrap().to_string_lossy().to_string())
+            .map(|p| {
+                Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         assert!(names.contains(&"report.pdf".to_string()));
         assert!(names.contains(&"notes.md".to_string()));
